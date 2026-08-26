@@ -58,7 +58,10 @@ actor ACPRequestRouter {
         case "elicitation/create":
             return try await handleCreateElicitation(request)
         default:
-            throw ClientError.invalidResponse
+            guard let delegate else {
+                throw ClientError.delegateNotSet
+            }
+            return try await delegate.handleCustomRequest(method: request.method, params: request.params)
         }
     }
 

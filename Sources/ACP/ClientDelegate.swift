@@ -51,6 +51,9 @@ public protocol ClientDelegate: AnyObject, Sendable {
 
     /// Handle URL-based elicitation completion notification
     func handleCompleteElicitation(_ notification: CompleteElicitationNotification) async throws
+
+    /// Handle an extension request not defined by the core ACP protocol.
+    func handleCustomRequest(method: String, params: AnyCodable?) async throws -> AnyCodable
 }
 
 public extension ClientDelegate {
@@ -76,6 +79,10 @@ public extension ClientDelegate {
 
     func handleCompleteElicitation(_ notification: CompleteElicitationNotification) async throws {
         // Default: no-op
+    }
+
+    func handleCustomRequest(method: String, params: AnyCodable?) async throws -> AnyCodable {
+        throw ClientError.invalidResponse
     }
 }
 

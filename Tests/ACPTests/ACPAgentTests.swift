@@ -434,6 +434,14 @@ final class ACPAgentTests: XCTestCase {
 
         XCTAssertEqual(elicitationResponse.action, "decline")
 
+        let custom = JSONRPCRequest(
+            id: .number(3),
+            method: "vendor/custom",
+            params: AnyCodable(["value": "input"])
+        )
+        let customResult = try await router.routeRequest(custom)
+        XCTAssertEqual(customResult.value as? String, "custom-response")
+
         try await router.routeNotification(JSONRPCNotification(
             method: "mcp/message",
             params: AnyCodable(["connectionId": "conn-1", "method": "notifications/progress"])
@@ -657,6 +665,11 @@ private actor RecordingClientDelegate: ClientDelegate {
 
     func handleCompleteElicitation(_ notification: CompleteElicitationNotification) async throws {
         events.append("elicitation-complete:\(notification.elicitationId.value)")
+    }
+
+    func handleCustomRequest(method: String, params: AnyCodable?) async throws -> AnyCodable {
+        events.append("custom-request:\(method)")
+        return AnyCodable("custom-response")
     }
 
     func recordedEvents() -> [String] {
