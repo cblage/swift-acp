@@ -3,6 +3,41 @@ import XCTest
 
 final class ACPClientTests: XCTestCase {
 
+    func testUserQuestionEnvelopeUsesDedicatedDelegate() async throws {
+        let router = ACPRequestRouter(encoder: JSONEncoder(), decoder: JSONDecoder())
+        let delegate = UserQuestionRecordingDelegate()
+        await router.setDelegate(delegate)
+        let rawInput = AnyCodable([
+            "questions": [[
+                "header": "Choice",
+                "question": "Pick one",
+                "options": [["label": "First", "description": "The first option"]],
+                "multiSelect": false,
+            ]],
+        ])
+        let params = RequestPermissionRequest(
+            options: [PermissionOption(kind: "allow_once", name: "Submit", optionId: "proceed_once")],
+            sessionId: SessionId("session-1"),
+            toolCall: ToolCallUpdate(toolCallId: "tool-1", rawInput: rawInput)
+        )
+        let paramsData = try JSONEncoder().encode(params)
+        let encodedParams = try JSONDecoder().decode(AnyCodable.self, from: paramsData)
+
+        let response = try await router.routeRequest(JSONRPCRequest(
+            id: .number(1),
+            method: "session/request_permission",
+            params: encodedParams
+        ))
+        let responseData = try JSONEncoder().encode(response)
+        let decoded = try JSONDecoder().decode(UserQuestionResponse.self, from: responseData)
+
+        let questionCount = await delegate.questionCount()
+        let permissionCount = await delegate.permissionCount()
+        XCTAssertEqual(questionCount, 1)
+        XCTAssertEqual(permissionCount, 0)
+        XCTAssertEqual(decoded.answers?["0"], "First")
+    }
+
     // MARK: - SessionId Tests
 
     func testSessionIdEncoding() throws {
@@ -907,4 +942,33 @@ final class ACPClientTests: XCTestCase {
         // Should encode without errors
         XCTAssertNotNil(data)
     }
+}
+
+private actor UserQuestionRecordingDelegate: ClientDelegate {
+    private var questions = 0
+    private var permissions = 0
+
+    func handleUserQuestion(_ request: UserQuestionRequest) async throws -> UserQuestionResponse {
+        questions += 1
+        return UserQuestionResponse(
+            outcome: UserQuestionOutcome(optionId: request.actions[0].id),
+            answers: ["0": request.questions[0].options[0].label]
+        )
+    }
+
+    func handlePermissionRequest(request: RequestPermissionRequest) async throws -> RequestPermissionResponse {
+        permissions += 1
+        return RequestPermissionResponse(outcome: PermissionOutcome(cancelled: true))
+    }
+
+    func questionCount() -> Int { questions }
+    func permissionCount() -> Int { permissions }
+
+    func handleFileReadRequest(_ path: String, sessionId: String, line: Int?, limit: Int?) async throws -> ReadTextFileResponse { fatalError() }
+    func handleFileWriteRequest(_ path: String, content: String, sessionId: String) async throws -> WriteTextFileResponse { fatalError() }
+    func handleTerminalCreate(command: String, sessionId: String, args: [String]?, cwd: String?, env: [EnvVariable]?, outputByteLimit: Int?) async throws -> CreateTerminalResponse { fatalError() }
+    func handleTerminalOutput(terminalId: TerminalId, sessionId: String) async throws -> TerminalOutputResponse { fatalError() }
+    func handleTerminalWaitForExit(terminalId: TerminalId, sessionId: String) async throws -> WaitForExitResponse { fatalError() }
+    func handleTerminalKill(terminalId: TerminalId, sessionId: String) async throws -> KillTerminalResponse { fatalError() }
+    func handleTerminalRelease(terminalId: TerminalId, sessionId: String) async throws -> ReleaseTerminalResponse { fatalError() }
 }

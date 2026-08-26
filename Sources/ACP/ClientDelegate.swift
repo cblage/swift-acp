@@ -34,6 +34,9 @@ public protocol ClientDelegate: AnyObject, Sendable {
     /// Handle permission request
     func handlePermissionRequest(request: RequestPermissionRequest) async throws -> RequestPermissionResponse
 
+    /// Handle an interactive user-question request carried by an ACP tool interaction.
+    func handleUserQuestion(_ request: UserQuestionRequest) async throws -> UserQuestionResponse
+
     /// Handle MCP-over-ACP connect request
     func handleMcpConnect(_ request: ConnectMcpRequest) async throws -> ConnectMcpResponse
 
@@ -57,6 +60,10 @@ public protocol ClientDelegate: AnyObject, Sendable {
 }
 
 public extension ClientDelegate {
+    func handleUserQuestion(_ request: UserQuestionRequest) async throws -> UserQuestionResponse {
+        UserQuestionResponse(outcome: UserQuestionOutcome())
+    }
+
     func handleMcpConnect(_ request: ConnectMcpRequest) async throws -> ConnectMcpResponse {
         throw ClientError.invalidResponse
     }

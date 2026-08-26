@@ -242,10 +242,32 @@ actor ACPRequestRouter {
         let data = try encoder.encode(params)
         let req = try decoder.decode(RequestPermissionRequest.self, from: data)
 
+        if let questionRequest = try decodeUserQuestionRequest(from: req) {
+            let response = try await delegate.handleUserQuestion(questionRequest)
+            let responseData = try encoder.encode(response)
+            return try decoder.decode(AnyCodable.self, from: responseData)
+        }
+
         let response = try await delegate.handlePermissionRequest(request: req)
 
         let responseData = try encoder.encode(response)
         return try decoder.decode(AnyCodable.self, from: responseData)
+    }
+
+    private func decodeUserQuestionRequest(from request: RequestPermissionRequest) throws -> UserQuestionRequest? {
+        guard let rawInput = request.toolCall.rawInput else { return nil }
+        let data = try encoder.encode(rawInput)
+        guard let input = try? decoder.decode(UserQuestionInput.self, from: data), !input.questions.isEmpty else {
+            return nil
+        }
+        return UserQuestionRequest(
+            sessionId: request.sessionId,
+            questions: input.questions,
+            metadata: input.metadata,
+            actions: request.options.map {
+                UserQuestionAction(kind: $0.kind, name: $0.name, id: $0.optionId)
+            }
+        )
     }
 
     private func handleMcpConnect(_ request: JSONRPCRequest) async throws -> AnyCodable {
@@ -309,4 +331,9 @@ actor ACPRequestRouter {
         let responseData = try encoder.encode(response)
         return try decoder.decode(AnyCodable.self, from: responseData)
     }
+}
+
+private struct UserQuestionInput: Decodable {
+    let questions: [UserQuestion]
+    let metadata: AnyCodable?
 }
