@@ -87,6 +87,12 @@ public struct JSONRPCNotification: Codable, Sendable {
     public let jsonrpc: String = "2.0"
     public let method: String
     public let params: AnyCodable?
+    /// The message's own bytes, set by the client on receipt and never
+    /// encoded: a consumer that wants a typed payload decodes it ONCE from
+    /// these, instead of re-encoding the generic `params` tree to JSON and
+    /// decoding that — two full passes per notification, which for a tool
+    /// frame carrying a whole terminal buffer is the cost of the frame.
+    public var rawData: Data? = nil
 
     enum CodingKeys: String, CodingKey {
         case jsonrpc, method, params

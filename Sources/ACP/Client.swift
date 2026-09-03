@@ -997,8 +997,9 @@ public actor Client {
     // MARK: - Private Methods
 
     private func handleMessage(data: Data) async {
-        guard let text = String(data: data, encoding: .utf8),
-              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        // A byte test, not a String decode plus a whitespace trim: both were
+        // full passes over the message, paid before the decoder even ran.
+        guard data.contains(where: { $0 != 0x20 && $0 != 0x09 && $0 != 0x0D && $0 != 0x0A }) else {
             return
         }
 
@@ -1019,7 +1020,10 @@ public actor Client {
             case .response(let response):
                 await handleResponse(response)
 
-            case .notification(let notification):
+            case .notification(var notification):
+                // The bytes ride along, so a consumer decodes its typed
+                // payload once from them instead of round-tripping `params`.
+                notification.rawData = data
                 notificationContinuation.yield(notification)
                 await handleIncomingNotification(notification)
 

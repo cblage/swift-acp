@@ -21,6 +21,20 @@ actor ACPProcessManager {
     private var stderrPipe: Pipe?
 
     private var readBuffer: Data = Data()
+    /// Bytes of `readBuffer` already handed out — ADVANCED, never shifted
+    /// out with `removeFirst`, and compacted only once they dominate the
+    /// buffer, so consuming a message costs its own length, amortised.
+    private var readOffset = 0
+    /// The framer's position and state, kept ACROSS chunks: a message that
+    /// arrives in pieces is scanned once, resuming where the last chunk
+    /// ended. The old framer copied the whole buffer into an array and
+    /// rescanned it from byte zero on every chunk, so a large frame cost
+    /// its size squared and a session's reader task ran flat out for the
+    /// length of a stream.
+    private var scanIndex = 0
+    private var scanDepth = 0
+    private var scanInString = false
+    private var scanEscaped = false
     private var largeBufferDumpCount: Int = 0
     private var lastLargeBufferDumpSize: Int = 0
 
@@ -232,7 +246,7 @@ actor ACPProcessManager {
         stdoutPipe = nil
         stderrPipe = nil
 
-        readBuffer.removeAll()
+        resetReadState()
     }
 
     // MARK: - I/O Operations
@@ -407,7 +421,7 @@ actor ACPProcessManager {
         stderrPipe = nil
         process = nil
         processGroupId = nil
-        readBuffer.removeAll()
+        resetReadState()
     }
 
     // MARK: - JSON Message Parsing
@@ -418,133 +432,142 @@ actor ACPProcessManager {
         }
     }
 
+    /// One complete top-level JSON value from the front of the buffer, or nil
+    /// while the buffer holds none. INCREMENTAL: the scanner's index and
+    /// state persist across calls, so a message arriving in chunks is walked
+    /// once, resuming where the previous chunk ended, and consumed bytes are
+    /// skipped by offset rather than shifted out. The old framer copied the
+    /// whole buffer into an array, rescanned it from byte zero on every
+    /// chunk, parsed each candidate through JSONSerialization just to
+    /// validate it, and `removeFirst`-shifted the remainder — four full
+    /// passes per message, quadratic for a chunked frame, and a session's
+    /// reader task ran flat out for the length of a stream. Validation is
+    /// the decoder's job: a malformed frame fails there and is logged.
     private func popNextMessage() -> Data? {
-        let whitespace: Set<UInt8> = [0x20, 0x09, 0x0D, 0x0A]
-        parseLoop: while true {
-            while let first = readBuffer.first, whitespace.contains(first) {
-                readBuffer.removeFirst()
-            }
-
-            guard !readBuffer.isEmpty else {
-                return nil
-            }
-
-            guard let first = readBuffer.first else { return nil }
-
-            if first != 0x7B && first != 0x5B {
-                if let jsonStart = readBuffer.firstIndex(where: { $0 == 0x7B || $0 == 0x5B }) {
-                    let dropCount = readBuffer.distance(from: readBuffer.startIndex, to: jsonStart)
-                    if dropCount > 0 {
-                        readBuffer.removeFirst(min(dropCount, readBuffer.count))
-                        logger.debug("Discarded \(dropCount) non-JSON prefix bytes before JSON start")
-                    }
-                    continue
+        while true {
+            let count = readBuffer.count
+            if scanDepth == 0 {
+                // At a boundary: skip whitespace and any non-JSON prefix.
+                var start = readOffset
+                while start < count, Self.isWhitespace(readBuffer[start]) { start += 1 }
+                guard start < count else {
+                    readOffset = count
+                    scanIndex = count
+                    compactReadBuffer()
+                    return nil
                 }
-
-                if let newline = readBuffer.firstIndex(of: 0x0A) {
-                    let dropped = readBuffer.prefix(upTo: newline)
-                    let removeCount = readBuffer.distance(from: readBuffer.startIndex, to: newline) + 1
-                    readBuffer.removeFirst(min(removeCount, readBuffer.count))
-                    if !dropped.isEmpty {
-                        logger.debug("Discarded non-JSON stdout line (\(dropped.count) bytes)")
-                    }
-                    continue
-                }
-
-                if readBuffer.count > 4096 {
-                    logger.warning("Discarding \(self.readBuffer.count) bytes of non-JSON stdout")
-                    self.readBuffer.removeAll(keepingCapacity: true)
-                }
-                return nil
-            }
-            let bytes = Array(readBuffer)
-
-            var depth = 0
-            var inString = false
-            var escaped = false
-
-            for endIndex in 0..<bytes.count {
-                let byte = bytes[endIndex]
-
-                if inString {
-                    if escaped {
-                        escaped = false
+                let first = readBuffer[start]
+                if first != 0x7B && first != 0x5B {
+                    if let jsonStart = readBuffer[start...].firstIndex(where: { $0 == 0x7B || $0 == 0x5B }) {
+                        logger.debug("Discarded \(jsonStart - start) non-JSON prefix bytes before JSON start")
+                        readOffset = jsonStart
+                        scanIndex = jsonStart
                         continue
                     }
-                    if byte == 0x5C {
-                        escaped = true
+                    if let newline = readBuffer[start...].firstIndex(of: 0x0A) {
+                        logger.debug("Discarded non-JSON stdout line (\(newline - start) bytes)")
+                        readOffset = newline + 1
+                        scanIndex = readOffset
                         continue
                     }
-                    if byte == 0x22 {
-                        inString = false
+                    if count - start > 4096 {
+                        logger.warning("Discarding \(count - start) bytes of non-JSON stdout")
+                        resetReadState()
                     }
-                    continue
+                    return nil
                 }
+                readOffset = start
+                scanIndex = start
+            }
 
-                if byte == 0x22 {
-                    inString = true
-                    continue
-                }
-
-                if byte == 0x7B || byte == 0x5B {
-                    depth += 1
-                } else if byte == 0x7D || byte == 0x5D {
-                    depth -= 1
-                    if depth == 0 {
-                        let candidate = Data(bytes[0...endIndex])
-                        if isValidJSONObjectMessage(candidate) {
-                            let removeCount = min(endIndex + 1, readBuffer.count)
-                            readBuffer.removeFirst(removeCount)
-                            return candidate
+            // Inside a message, or at its first byte: walk on from the
+            // persisted index with the persisted string and depth state.
+            var end: Int?
+            readBuffer.withUnsafeBytes { raw in
+                let bytes = raw.bindMemory(to: UInt8.self)
+                var index = scanIndex
+                while index < count {
+                    let byte = bytes[index]
+                    if scanInString {
+                        if scanEscaped {
+                            scanEscaped = false
+                        } else if byte == 0x5C {
+                            scanEscaped = true
+                        } else if byte == 0x22 {
+                            scanInString = false
                         }
-
-                        // Malformed JSON-like object: drop one byte and retry to re-sync.
-                        logger.warning("Discarded malformed JSON-like segment (\(candidate.count) bytes)")
-                        readBuffer.removeFirst(min(1, readBuffer.count))
-                        continue parseLoop
+                    } else if byte == 0x22 {
+                        scanInString = true
+                    } else if byte == 0x7B || byte == 0x5B {
+                        scanDepth += 1
+                    } else if byte == 0x7D || byte == 0x5D {
+                        scanDepth -= 1
+                        if scanDepth <= 0 {
+                            end = index
+                            index += 1
+                            break
+                        }
                     }
+                    index += 1
                 }
+                scanIndex = index
             }
 
-            if let newline = readBuffer.firstIndex(of: 0x0A) {
-                let line = Data(readBuffer.prefix(upTo: newline))
-                if !line.isEmpty, !isValidJSONObjectMessage(line) {
-                    let removeCount = readBuffer.distance(from: readBuffer.startIndex, to: newline) + 1
-                    readBuffer.removeFirst(min(removeCount, readBuffer.count))
-                    logger.warning("Discarded malformed JSON stdout line (\(line.count) bytes)")
-                    continue
+            guard let end else {
+                if count - readOffset > Self.largeBufferWarningThreshold {
+                    logger.warning("Large buffer (\(count - readOffset) bytes) without complete JSON message")
                 }
+                return nil
             }
-
-            if readBuffer.count > Self.largeBufferWarningThreshold {
-                logger.warning("Large buffer (\(self.readBuffer.count) bytes) without complete JSON message")
-            }
-
-            return nil
+            let message = readBuffer.subdata(in: readOffset..<(end + 1))
+            readOffset = end + 1
+            scanIndex = readOffset
+            scanDepth = 0
+            scanInString = false
+            scanEscaped = false
+            compactReadBuffer()
+            return message
         }
     }
 
-    private func isValidJSONObjectMessage(_ data: Data) -> Bool {
-        guard let object = try? JSONSerialization.jsonObject(with: data) else {
-            return false
-        }
+    private static func isWhitespace(_ byte: UInt8) -> Bool {
+        byte == 0x20 || byte == 0x09 || byte == 0x0D || byte == 0x0A
+    }
 
-        if object is [String: Any] || object is [Any] {
-            return true
+    /// Drops the consumed prefix once it dominates the buffer — one memmove
+    /// per half-buffer of traffic, amortised O(1) per byte — or the whole
+    /// buffer once everything is consumed.
+    private func compactReadBuffer() {
+        guard readOffset > 0 else { return }
+        if readOffset >= readBuffer.count {
+            readBuffer.removeAll(keepingCapacity: true)
+            readOffset = 0
+            scanIndex = 0
+        } else if readOffset >= 65536, readOffset * 2 >= readBuffer.count {
+            readBuffer.removeSubrange(0..<readOffset)
+            scanIndex -= readOffset
+            readOffset = 0
         }
+    }
 
-        return false
+    private func resetReadState() {
+        readBuffer.removeAll()
+        readOffset = 0
+        scanIndex = 0
+        scanDepth = 0
+        scanInString = false
+        scanEscaped = false
     }
 
     private func flushRemainingBufferIfNeeded() async {
         await drainBufferedMessages()
 
-        if !readBuffer.isEmpty {
-            let remaining = readBuffer
-            readBuffer.removeAll(keepingCapacity: true)
-            if !remaining.isEmpty {
-                await onDataReceived?(remaining)
-            }
+        let remaining = readBuffer.count > readOffset
+            ? readBuffer.subdata(in: readOffset..<readBuffer.count)
+            : Data()
+        resetReadState()
+        if !remaining.isEmpty {
+            await onDataReceived?(remaining)
         }
     }
 
