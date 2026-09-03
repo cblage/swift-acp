@@ -86,7 +86,19 @@ public struct JSONRPCResponse: Codable, Sendable {
 public struct JSONRPCNotification: Codable, Sendable {
     public let jsonrpc: String = "2.0"
     public let method: String
-    public let params: AnyCodable?
+    /// The generic parameter tree. For a notification the client built on
+    /// its received bytes (`init(method:rawData:)`) it is DECODED ON DEMAND:
+    /// the tree is one full pass over the message, and a consumer decoding
+    /// its typed payload from `rawData` never reads it, so the receive path
+    /// no longer pays it for every notification. Decoded or constructed
+    /// notifications carry the tree as before.
+    public var params: AnyCodable? {
+        if let storedParams { return storedParams }
+        guard decodesParamsLazily, let rawData else { return nil }
+        return try? JSONDecoder().decode(ParamsEnvelope.self, from: rawData).params
+    }
+    private let storedParams: AnyCodable?
+    private let decodesParamsLazily: Bool
     /// The message's own bytes, set by the client on receipt and never
     /// encoded: a consumer that wants a typed payload decodes it ONCE from
     /// these, instead of re-encoding the generic `params` tree to JSON and
@@ -98,9 +110,37 @@ public struct JSONRPCNotification: Codable, Sendable {
         case jsonrpc, method, params
     }
 
+    private struct ParamsEnvelope: Decodable {
+        let params: AnyCodable?
+    }
+
     public init(method: String, params: AnyCodable?) {
         self.method = method
-        self.params = params
+        self.storedParams = params
+        self.decodesParamsLazily = false
+    }
+
+    /// The client's receive path: the method is already known, the bytes
+    /// are kept, and `params` decodes from them only if something reads it.
+    public init(method: String, rawData: Data) {
+        self.method = method
+        self.storedParams = nil
+        self.decodesParamsLazily = true
+        self.rawData = rawData
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        method = try container.decode(String.self, forKey: .method)
+        storedParams = try container.decodeIfPresent(AnyCodable.self, forKey: .params)
+        decodesParamsLazily = false
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(jsonrpc, forKey: .jsonrpc)
+        try container.encode(method, forKey: .method)
+        try container.encodeIfPresent(params, forKey: .params)
     }
 }
 

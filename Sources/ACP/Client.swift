@@ -56,6 +56,16 @@ public actor Client {
     private let notificationStream: AsyncStream<JSONRPCNotification>
     private var notificationsYielded = 0
 
+    /// The receive path's classifier: `method` names a request or a
+    /// notification, `id` tells them apart, and a `null` id reads as absent
+    /// — the same rule `Message` applies. An id that decodes as neither
+    /// string nor number fails the decode, and the message takes the full
+    /// path instead.
+    private struct MessageEnvelope: Decodable {
+        let method: String?
+        let id: RequestId?
+    }
+
     private var debugContinuation: AsyncStream<DebugMessage>.Continuation?
     private var debugStream: AsyncStream<DebugMessage>?
 
@@ -1035,6 +1045,24 @@ public actor Client {
         }
 
         do {
+            // A NOTIFICATION SKIPS THE TREE: a light envelope classifies the
+            // message, and a notification is built on its own bytes with
+            // `params` decoding on demand — the full `Message` decode built
+            // an `AnyCodable` tree for every notification that a consumer
+            // decoding its typed payload from the same bytes never read
+            // (2026-09-03 profile: the readers ran flat out through a
+            // replay). Requests, responses, and anything the envelope cannot
+            // classify — a malformed id — take the full decode as before,
+            // whose own rule still reads `"id": null` as a notification.
+            if let envelope = try? decoder.decode(MessageEnvelope.self, from: data),
+               let method = envelope.method, envelope.id == nil {
+                let notification = JSONRPCNotification(method: method, rawData: data)
+                notificationsYielded += 1
+                notificationContinuation.yield(notification)
+                await handleIncomingNotification(notification)
+                return
+            }
+
             let message = try decoder.decode(Message.self, from: data)
 
             switch message {

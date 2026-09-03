@@ -522,26 +522,33 @@ actor ACPProcessManager {
             // Inside a message, or at its first byte: walk on from the
             // persisted index with the persisted string and depth state.
             var end: Int?
+            // The walk runs on LOCALS and writes the state back once: every
+            // actor property access is a dynamic exclusivity check, and the
+            // first cut paid three or four of them per byte — slower per
+            // byte than the buffer copy it replaced.
+            var index = scanIndex
+            var depth = scanDepth
+            var inString = scanInString
+            var escaped = scanEscaped
             readBuffer.withUnsafeBytes { raw in
                 let bytes = raw.bindMemory(to: UInt8.self)
-                var index = scanIndex
                 while index < count {
                     let byte = bytes[index]
-                    if scanInString {
-                        if scanEscaped {
-                            scanEscaped = false
+                    if inString {
+                        if escaped {
+                            escaped = false
                         } else if byte == 0x5C {
-                            scanEscaped = true
+                            escaped = true
                         } else if byte == 0x22 {
-                            scanInString = false
+                            inString = false
                         }
                     } else if byte == 0x22 {
-                        scanInString = true
+                        inString = true
                     } else if byte == 0x7B || byte == 0x5B {
-                        scanDepth += 1
+                        depth += 1
                     } else if byte == 0x7D || byte == 0x5D {
-                        scanDepth -= 1
-                        if scanDepth <= 0 {
+                        depth -= 1
+                        if depth <= 0 {
                             end = index
                             index += 1
                             break
@@ -549,8 +556,11 @@ actor ACPProcessManager {
                     }
                     index += 1
                 }
-                scanIndex = index
             }
+            scanIndex = index
+            scanDepth = depth
+            scanInString = inString
+            scanEscaped = escaped
 
             guard let end else {
                 if count - readOffset > Self.largeBufferWarningThreshold {
