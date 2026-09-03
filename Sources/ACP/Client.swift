@@ -54,6 +54,7 @@ public actor Client {
 
     private let notificationContinuation: AsyncStream<JSONRPCNotification>.Continuation
     private let notificationStream: AsyncStream<JSONRPCNotification>
+    private var notificationsYielded = 0
 
     private var debugContinuation: AsyncStream<DebugMessage>.Continuation?
     private var debugStream: AsyncStream<DebugMessage>?
@@ -94,6 +95,18 @@ public actor Client {
 
     public var notifications: AsyncStream<JSONRPCNotification> {
         notificationStream
+    }
+
+    /// How many notifications have been handed to `notifications` so far.
+    /// Messages are handled in the order the agent sent them and each
+    /// notification is counted BEFORE it is yielded, so the count read after
+    /// a response covers every notification the agent sent ahead of that
+    /// response: a consumer that has taken this many has seen all of them,
+    /// whatever the stream still buffers. A time-based quiet wait in the
+    /// consumer cannot establish that — it only held while the reader was
+    /// slow enough never to build a backlog.
+    public var notificationsDelivered: Int {
+        notificationsYielded
     }
 
     public var debugMessages: AsyncStream<DebugMessage>? {
@@ -1032,6 +1045,7 @@ public actor Client {
                 // The bytes ride along, so a consumer decodes its typed
                 // payload once from them instead of round-tripping `params`.
                 notification.rawData = data
+                notificationsYielded += 1
                 notificationContinuation.yield(notification)
                 await handleIncomingNotification(notification)
 
