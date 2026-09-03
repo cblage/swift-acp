@@ -49,6 +49,15 @@ actor ACPProcessManager {
     private var onDataReceived: ((Data) async -> Void)?
     private var onTermination: ((Int32) async -> Void)?
 
+    /// Stdin writes run HERE, never on the actor: a write to a full pipe
+    /// blocks until the agent reads, and an agent busy emitting a replay
+    /// may not read for tens of seconds. On the actor that blocked
+    /// `processOutput` too, so stdout went unprocessed for exactly as long
+    /// — a 2026-09-03 profile showed model and effort requests parked
+    /// 14–32s in the write while the reader waited on the actor and the
+    /// transcript stalled. A serial queue keeps the writes ordered.
+    private let writeQueue = DispatchQueue(label: "org.acp.process.stdin")
+
     private enum OutputChunk: Sendable {
         case stdout(Data)
         case stderr(Data)
@@ -261,7 +270,37 @@ actor ACPProcessManager {
         var lineData = data
         lineData.append(0x0A)
 
-        try stdin.write(contentsOf: lineData)
+        // Only the descriptor crosses to the queue: the write loop is POSIX
+        // so the closure captures nothing but Sendable values, and a
+        // handle closed under a blocked write surfaces as an error here
+        // instead of a hang.
+        let fd = stdin.fileDescriptor
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            writeQueue.async {
+                // A raw write to a pipe whose reader has died raises SIGPIPE
+                // for the whole process; the descriptor opts out so a dead
+                // agent reads as EPIPE, the error path, not a kill.
+                _ = fcntl(fd, F_SETNOSIGPIPE, 1)
+                let failure: Int32 = lineData.withUnsafeBytes { raw in
+                    guard let base = raw.baseAddress else { return 0 }
+                    var offset = 0
+                    while offset < raw.count {
+                        let written = Darwin.write(fd, base + offset, raw.count - offset)
+                        if written < 0 {
+                            if errno == EINTR { continue }
+                            return errno
+                        }
+                        offset += written
+                    }
+                    return 0
+                }
+                if failure == 0 {
+                    continuation.resume()
+                } else {
+                    continuation.resume(throwing: ClientError.transportError("stdin write failed: \(String(cString: strerror(failure)))"))
+                }
+            }
+        }
     }
 
     // MARK: - Callbacks
