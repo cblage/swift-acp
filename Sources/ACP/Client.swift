@@ -324,6 +324,13 @@ public actor Client {
         }
     }
 
+    public func setPermissionMode(
+        sessionId: SessionId,
+        modeId: String
+    ) async throws -> SetModeResponse {
+        try await setMode(sessionId: sessionId, modeId: modeId)
+    }
+
     public func setModel(
         sessionId: SessionId,
         modelId: String
