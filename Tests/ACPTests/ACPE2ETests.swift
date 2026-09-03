@@ -385,6 +385,36 @@ final class ACPE2ETests: XCTestCase {
         await client.terminate()
     }
 
+    func testInitializeRecoversAfterNoisyLinesWithUnmatchedDelimiters() async throws {
+        try createMockAgent(script: """
+        while read -r line; do
+            id=$(echo "$line" | grep -o '"id":[0-9]*' | grep -o '[0-9]*')
+            method=$(echo "$line" | grep -o '"method":"[^"]*"' | sed 's/"method":"\\([^"]*\\)"/\\1/')
+
+            if [ "$method" = "initialize" ]; then
+                echo 'debug: opening config {'
+                echo 'debug: collecting values ['
+                echo '{"jsonrpc":"2.0","id":'$id',"result":{"protocolVersion":1,"agentCapabilities":{},"agentInfo":{"name":"NoiseRecoveredAgent","version":"1.0.0"}}}'
+                break
+            fi
+        done
+        """)
+
+        let client = Client()
+        try await client.launch(agentPath: mockAgentPath)
+
+        let response = try await client.initialize(
+            protocolVersion: 1,
+            capabilities: makeCapabilities(),
+            timeout: 5.0
+        )
+
+        XCTAssertEqual(response.protocolVersion, 1)
+        XCTAssertEqual(response.agentInfo?.name, "NoiseRecoveredAgent")
+
+        await client.terminate()
+    }
+
     func testProcessTerminationError() async throws {
         try createMockAgent(script: """
         # Exit immediately

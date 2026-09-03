@@ -19,6 +19,7 @@ actor ACPProcessManager {
     private var stdinPipe: Pipe?
     private var stdoutPipe: Pipe?
     private var stderrPipe: Pipe?
+    private var stdinDescriptor: Int32 = -1
 
     private var readBuffer: Data = Data()
     /// Bytes of `readBuffer` already handed out — ADVANCED, never shifted
@@ -171,6 +172,7 @@ actor ACPProcessManager {
         }
 
         try proc.run()
+        stdinDescriptor = stdin.fileHandleForWriting.fileDescriptor
         process = proc
         processGroupId = nil
         if proc.processIdentifier > 0 {
@@ -223,6 +225,7 @@ actor ACPProcessManager {
         stdoutPipe?.fileHandleForReading.readabilityHandler = nil
         stderrPipe?.fileHandleForReading.readabilityHandler = nil
 
+        stdinDescriptor = -1
         try? stdinPipe?.fileHandleForWriting.close()
         try? stdoutPipe?.fileHandleForReading.close()
         try? stderrPipe?.fileHandleForReading.close()
@@ -261,7 +264,8 @@ actor ACPProcessManager {
     // MARK: - I/O Operations
 
     func writeMessage<T: Encodable>(_ message: T) async throws {
-        guard let stdin = stdinPipe?.fileHandleForWriting else {
+        let fd = stdinDescriptor
+        guard fd >= 0, let proc = process, proc.isRunning else {
             throw ClientError.processNotRunning
         }
 
@@ -274,7 +278,6 @@ actor ACPProcessManager {
         // so the closure captures nothing but Sendable values, and a
         // handle closed under a blocked write surfaces as an error here
         // instead of a hang.
-        let fd = stdin.fileDescriptor
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             writeQueue.async {
                 // A raw write to a pipe whose reader has died raises SIGPIPE
@@ -453,6 +456,7 @@ actor ACPProcessManager {
         await finishOutputProcessing()
         await flushRemainingBufferIfNeeded()
 
+        stdinDescriptor = -1
         try? stdinPipe?.fileHandleForWriting.close()
 
         stdinPipe = nil
@@ -522,6 +526,7 @@ actor ACPProcessManager {
             // Inside a message, or at its first byte: walk on from the
             // persisted index with the persisted string and depth state.
             var end: Int?
+            var malformedLineEnd: Int?
             // The walk runs on LOCALS and writes the state back once: every
             // actor property access is a dynamic exclusivity check, and the
             // first cut paid three or four of them per byte — slower per
@@ -534,7 +539,18 @@ actor ACPProcessManager {
                 let bytes = raw.bindMemory(to: UInt8.self)
                 while index < count {
                     let byte = bytes[index]
-                    if inString {
+                    if byte == 0x0A {
+                        // ACP stdio is newline-delimited JSON. A newline
+                        // reached before the top-level value closes marks a
+                        // malformed/noisy line, including diagnostics such
+                        // as `opening config {`. Recover at that boundary so
+                        // one unmatched delimiter cannot absorb every later
+                        // response. This remains part of the same one-pass
+                        // scan, so fragmented valid lines are never rescanned.
+                        malformedLineEnd = index
+                        index += 1
+                        break
+                    } else if inString {
                         if escaped {
                             escaped = false
                         } else if byte == 0x5C {
@@ -561,6 +577,17 @@ actor ACPProcessManager {
             scanDepth = depth
             scanInString = inString
             scanEscaped = escaped
+
+            if let malformedLineEnd {
+                logger.warning("Discarded malformed JSON stdout line (\(malformedLineEnd - self.readOffset) bytes)")
+                readOffset = malformedLineEnd + 1
+                scanIndex = readOffset
+                scanDepth = 0
+                scanInString = false
+                scanEscaped = false
+                compactReadBuffer()
+                continue
+            }
 
             guard let end else {
                 if count - readOffset > Self.largeBufferWarningThreshold {

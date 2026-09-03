@@ -455,6 +455,7 @@ final class ACPAgentTests: XCTestCase {
         XCTAssertEqual(events, [
             "mcp-connect:server-1",
             "elicitation-create:url",
+            "custom-request:vendor/custom",
             "mcp-notification:conn-1:notifications/progress",
             "elicitation-complete:elicit-1",
         ])
