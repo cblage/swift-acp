@@ -515,7 +515,7 @@ actor ACPProcessManager {
 
             guard let end else {
                 if count - readOffset > Self.largeBufferWarningThreshold {
-                    logger.warning("Large buffer (\(count - readOffset) bytes) without complete JSON message")
+                    logger.warning("Large buffer (\(count - self.readOffset) bytes) without complete JSON message")
                 }
                 return nil
             }
