@@ -37,6 +37,19 @@ public actor Client {
     private let errorHandler: ErrorHandler
 
     private var pendingRequests: [RequestId: CheckedContinuation<JSONRPCResponse, Error>] = [:]
+    /// A deadline per bounded request — a GCD work item, NOT a task. The old
+    /// timeout raced the request against a sleeping child in a task group,
+    /// which on expiry threw out of the group and then awaited the very
+    /// child a silent agent had parked, so it never returned; and every
+    /// request cost one task to sleep and another to register and write.
+    /// The item fires only when the bound actually lapses; a request that
+    /// answers in time cancels it and creates nothing.
+    private var pendingTimeouts: [RequestId: DispatchWorkItem] = [:]
+    /// Requests written but not yet awaited: a response arriving in the gap
+    /// while the write suspends this actor parks in `earlyResponses` for the
+    /// continuation that registers right after it.
+    private var expectedRequestIds: Set<RequestId> = []
+    private var earlyResponses: [RequestId: JSONRPCResponse] = [:]
     private var nextRequestId: Int = 1
 
     private let notificationContinuation: AsyncStream<JSONRPCNotification>.Continuation
@@ -49,10 +62,6 @@ public actor Client {
     private let encoder: JSONEncoder
 
     public weak var delegate: ClientDelegate?
-
-    private enum TimeoutError: Error {
-        case requestTimedOut
-    }
 
     // MARK: - Initialization
 
@@ -223,14 +232,15 @@ public actor Client {
 
     public func authenticate(
         authMethodId: String,
-        credentials: [String: String]? = nil
+        credentials: [String: String]? = nil,
+        timeout: TimeInterval? = nil
     ) async throws -> AuthenticateResponse {
         let request = AuthenticateRequest(
             methodId: authMethodId,
             credentials: credentials
         )
 
-        let response = try await sendRequest(method: "authenticate", params: request, timeout: nil)
+        let response = try await sendRequest(method: "authenticate", params: request, timeout: timeout)
 
         if let error = response.error {
             throw ClientError.agentError(error)
@@ -329,12 +339,14 @@ public actor Client {
     public func setConfigOption(
         sessionId: SessionId,
         configId: SessionConfigId,
-        value: SessionConfigValueId
+        value: SessionConfigValueId,
+        timeout: TimeInterval? = nil
     ) async throws -> SetSessionConfigOptionResponse {
         return try await setConfigOption(
             sessionId: sessionId,
             configId: configId,
-            value: .select(value)
+            value: .select(value),
+            timeout: timeout
         )
     }
 
@@ -353,7 +365,8 @@ public actor Client {
     public func setConfigOption(
         sessionId: SessionId,
         configId: SessionConfigId,
-        value: SessionConfigOptionValue
+        value: SessionConfigOptionValue,
+        timeout: TimeInterval? = nil
     ) async throws -> SetSessionConfigOptionResponse {
         let request = SetSessionConfigOptionRequest(
             sessionId: sessionId,
@@ -361,7 +374,9 @@ public actor Client {
             value: value
         )
 
-        let response = try await sendRequest(method: "session/set_config_option", params: request)
+        let response = try await sendRequest(
+            method: "session/set_config_option", params: request, timeout: timeout
+        )
 
         if let error = response.error {
             throw ClientError.agentError(error)
@@ -383,7 +398,8 @@ public actor Client {
         sessionId: SessionId,
         cwd: String,
         additionalDirectories: [String]? = nil,
-        mcpServers: [MCPServerConfig] = []
+        mcpServers: [MCPServerConfig] = [],
+        timeout: TimeInterval? = nil
     ) async throws -> LoadSessionResponse {
         let request = LoadSessionRequest(
             sessionId: sessionId,
@@ -392,7 +408,7 @@ public actor Client {
             mcpServers: mcpServers
         )
 
-        let response = try await sendRequest(method: "session/load", params: request)
+        let response = try await sendRequest(method: "session/load", params: request, timeout: timeout)
 
         if let error = response.error {
             if isSessionAlreadyActive(error) {
@@ -438,7 +454,8 @@ public actor Client {
         sessionId: SessionId,
         cwd: String,
         additionalDirectories: [String]? = nil,
-        mcpServers: [MCPServerConfig] = []
+        mcpServers: [MCPServerConfig] = [],
+        timeout: TimeInterval? = nil
     ) async throws -> ResumeSessionResponse {
         let request = ResumeSessionRequest(
             sessionId: sessionId,
@@ -447,7 +464,7 @@ public actor Client {
             mcpServers: mcpServers
         )
 
-        let response = try await sendRequest(method: "session/resume", params: request)
+        let response = try await sendRequest(method: "session/resume", params: request, timeout: timeout)
 
         if let error = response.error {
             throw ClientError.agentError(error)
@@ -507,9 +524,11 @@ public actor Client {
         return try decoder.decode(ListSessionsResponse.self, from: data)
     }
 
-    public func closeSession(sessionId: SessionId) async throws -> CloseSessionResponse {
+    public func closeSession(
+        sessionId: SessionId, timeout: TimeInterval? = nil
+    ) async throws -> CloseSessionResponse {
         let request = CloseSessionRequest(sessionId: sessionId)
-        let response = try await sendRequest(method: "session/close", params: request)
+        let response = try await sendRequest(method: "session/close", params: request, timeout: timeout)
 
         if let error = response.error {
             throw ClientError.agentError(error)
@@ -880,49 +899,41 @@ public actor Client {
             method: method,
             params: paramsValue
         )
-        return try await withRequestTimeout(seconds: timeout, requestId: requestId) {
-            try await withCheckedThrowingContinuation { continuation in
-                Task {
-                    await self.registerRequest(id: requestId, continuation: continuation)
-
-                    do {
-                        try await self.writeMessageWithDebug(request, method: method)
-                    } catch {
-                        await self.failRequest(id: requestId, error: error)
-                    }
-                }
-            }
-        }
-    }
-
-    private func withRequestTimeout<T>(
-        seconds: TimeInterval?,
-        requestId: RequestId,
-        operation: @escaping () async throws -> T
-    ) async throws -> T {
-        guard let seconds = seconds else {
-            return try await operation()
-        }
-
+        // TASK-FREE on the ordinary path: the id is expected BEFORE the write,
+        // so a response landing while the write suspends this actor parks in
+        // `earlyResponses`; the continuation registers synchronously after
+        // the write, on this actor, leaving no gap for a response to miss.
+        expectedRequestIds.insert(requestId)
         do {
-            return try await withThrowingTaskGroup(of: T.self) { group in
-                group.addTask {
-                    try await operation()
+            try await writeMessageWithDebug(request, method: method)
+        } catch {
+            expectedRequestIds.remove(requestId)
+            earlyResponses.removeValue(forKey: requestId)
+            throw error
+        }
+        if let early = earlyResponses.removeValue(forKey: requestId) {
+            expectedRequestIds.remove(requestId)
+            return early
+        }
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                pendingRequests[requestId] = continuation
+                if let timeout {
+                    // The deadline: a work item that spawns a task ONLY when
+                    // it fires. A late answer then finds no continuation and
+                    // is dropped; the request is abandoned, never awaited.
+                    let deadline = DispatchWorkItem { [weak self] in
+                        guard let self else { return }
+                        Task { await self.failRequest(id: requestId, error: ClientError.requestTimeout) }
+                    }
+                    pendingTimeouts[requestId] = deadline
+                    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: deadline)
                 }
-                group.addTask {
-                    try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-                    throw TimeoutError.requestTimedOut
-                }
-
-                guard let result = try await group.next() else {
-                    throw TimeoutError.requestTimedOut
-                }
-                group.cancelAll()
-                return result
             }
-        } catch is TimeoutError {
-            pendingRequests.removeValue(forKey: requestId)
-            throw ClientError.requestTimeout
+        } onCancel: {
+            // A cancelled caller is released at once and the request
+            // abandoned the same way a timed-out one is.
+            Task { await self.failRequest(id: requestId, error: CancellationError()) }
         }
     }
 
@@ -983,10 +994,7 @@ public actor Client {
     public func terminate() async {
         await processManager.terminate()
 
-        for (_, continuation) in pendingRequests {
-            continuation.resume(throwing: ClientError.processNotRunning)
-        }
-        pendingRequests.removeAll()
+        failAllRequests(error: ClientError.processNotRunning)
 
         notificationContinuation.finish()
         debugContinuation?.finish()
@@ -1042,12 +1050,21 @@ public actor Client {
     }
 
     private func handleResponse(_ response: JSONRPCResponse) async {
-        guard let continuation = pendingRequests.removeValue(forKey: response.id) else {
-            let stillPending = pendingRequests.keys.map { String(describing: $0) }
-            logger.warning("Received response for unknown request id=\(response.id), no pending request found. Pending: \(stillPending)")
+        if let continuation = pendingRequests.removeValue(forKey: response.id) {
+            expectedRequestIds.remove(response.id)
+            pendingTimeouts.removeValue(forKey: response.id)?.cancel()
+            continuation.resume(returning: response)
             return
         }
-        continuation.resume(returning: response)
+        if expectedRequestIds.contains(response.id) {
+            // Answered before the caller reached its continuation — the
+            // write suspended this actor and the reply won the race. Held
+            // for the registration that follows the write.
+            earlyResponses[response.id] = response
+            return
+        }
+        let stillPending = pendingRequests.keys.map { String(describing: $0) }
+        logger.warning("Received response for unknown request id=\(response.id), no pending request found. Pending: \(stillPending)")
     }
 
     private func handleIncomingRequest(_ request: JSONRPCRequest) async {
@@ -1098,25 +1115,33 @@ public actor Client {
     private func handleTermination(exitCode: Int32) async {
         logger.info("Agent process terminated with code: \(exitCode)")
 
-        for (_, continuation) in pendingRequests {
-            continuation.resume(throwing: ClientError.processFailed(exitCode))
-        }
-        pendingRequests.removeAll()
+        failAllRequests(error: ClientError.processFailed(exitCode))
 
         notificationContinuation.finish()
     }
 
-    private func registerRequest(
-        id: RequestId,
-        continuation: CheckedContinuation<JSONRPCResponse, Error>
-    ) async {
-        pendingRequests[id] = continuation
-    }
-
     private func failRequest(id: RequestId, error: Error) async {
+        expectedRequestIds.remove(id)
+        earlyResponses.removeValue(forKey: id)
+        pendingTimeouts.removeValue(forKey: id)?.cancel()
         if let continuation = pendingRequests.removeValue(forKey: id) {
             continuation.resume(throwing: error)
         }
+    }
+
+    /// Every pending request fails with `error`, every deadline is cancelled,
+    /// and the early-response bookkeeping clears — teardown's one sweep.
+    private func failAllRequests(error: Error) {
+        for (_, continuation) in pendingRequests {
+            continuation.resume(throwing: error)
+        }
+        pendingRequests.removeAll()
+        for (_, deadline) in pendingTimeouts {
+            deadline.cancel()
+        }
+        pendingTimeouts.removeAll()
+        expectedRequestIds.removeAll()
+        earlyResponses.removeAll()
     }
 
     private func extractMethod(from data: Data) -> String? {
