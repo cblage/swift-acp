@@ -54,7 +54,21 @@ public actor Client {
 
     private let notificationContinuation: AsyncStream<JSONRPCNotification>.Continuation
     private let notificationStream: AsyncStream<JSONRPCNotification>
-    private var notificationsYielded = 0
+
+    /// THE RECEIVE PATH'S STATE, touched on the process reader's queue and
+    /// read from the actor, so it lives under a lock: the handler a
+    /// consumer installed, the closed sink, the delivered count, and the
+    /// debug continuation the queue yields incoming frames to.
+    private let receiveLock = NSLock()
+    nonisolated(unsafe) private var notificationSink: (@Sendable (JSONRPCNotification) -> Void)?
+    nonisolated(unsafe) private var closedSink: (@Sendable () -> Void)?
+    nonisolated(unsafe) private var notificationsYielded = 0
+    nonisolated(unsafe) private var debugContinuation: AsyncStream<DebugMessage>.Continuation?
+    /// The read queue's own decoder, never shared with the actor's.
+    private let receiveDecoder = JSONDecoder()
+    /// The notification methods the request router handles for a delegate
+    /// — the only ones worth a hop onto its actor.
+    private static let routedNotificationMethods: Set<String> = ["mcp/message", "elicitation/complete"]
 
     /// The receive path's classifier: `method` names a request or a
     /// notification, `id` tells them apart, and a `null` id reads as absent
@@ -66,7 +80,6 @@ public actor Client {
         let id: RequestId?
     }
 
-    private var debugContinuation: AsyncStream<DebugMessage>.Continuation?
     private var debugStream: AsyncStream<DebugMessage>?
 
     private let decoder: JSONDecoder
@@ -91,32 +104,55 @@ public actor Client {
         requestRouter = ACPRequestRouter(encoder: encoder, decoder: decoder)
         errorHandler = ErrorHandler(encoder: encoder)
 
-        Task {
-            await processManager.setDataReceivedCallback { [weak self] data in
-                await self?.handleMessage(data: data)
-            }
-            await processManager.setTerminationCallback { [weak self] exitCode in
-                await self?.handleTermination(exitCode: exitCode)
-            }
-        }
+        // Installed synchronously, before any launch can race them: the
+        // frames arrive on the reader's queue and `receive` classifies them
+        // there, without a hop onto this actor.
+        processManager.setHandlers(
+            onMessage: { [weak self] data in self?.receive(data) },
+            onTermination: { [weak self] exitCode in await self?.handleTermination(exitCode: exitCode) }
+        )
     }
 
     // MARK: - Public API
 
+    /// Every notification, for a consumer that installed no handler through
+    /// `setNotificationHandler`. While a handler is installed the stream
+    /// yields nothing, so an unread stream cannot buffer without bound.
     public var notifications: AsyncStream<JSONRPCNotification> {
         notificationStream
     }
 
-    /// How many notifications have been handed to `notifications` so far.
-    /// Messages are handled in the order the agent sent them and each
-    /// notification is counted BEFORE it is yielded, so the count read after
-    /// a response covers every notification the agent sent ahead of that
-    /// response: a consumer that has taken this many has seen all of them,
-    /// whatever the stream still buffers. A time-based quiet wait in the
-    /// consumer cannot establish that — it only held while the reader was
-    /// slow enough never to build a backlog.
+    /// Delivers every notification SYNCHRONOUSLY on the client's read queue,
+    /// in the order the agent sent them, the moment its frame is complete —
+    /// no stream, no task, no actor hop between the pipe and the handler.
+    /// Install BEFORE `launch`, so nothing goes to the stream instead. The
+    /// handler decodes on that queue and hands off however it likes; it
+    /// must not block. `onClosed` fires once, from the actor, when the
+    /// receive path ends — the process's termination or `terminate()` —
+    /// after the last notification was delivered. Passing nil uninstalls
+    /// both.
+    nonisolated public func setNotificationHandler(
+        _ handler: (@Sendable (JSONRPCNotification) -> Void)?,
+        onClosed: (@Sendable () -> Void)? = nil
+    ) {
+        receiveLock.lock()
+        notificationSink = handler
+        closedSink = handler == nil ? nil : onClosed
+        receiveLock.unlock()
+    }
+
+    /// How many notifications have been delivered so far — to the handler
+    /// or to `notifications`. Frames are delivered in the order the agent
+    /// sent them and each notification is counted BEFORE it is delivered,
+    /// so the count read after a response covers every notification the
+    /// agent sent ahead of that response: a consumer that has applied this
+    /// many has seen all of them, whatever still waits. A time-based quiet
+    /// wait in the consumer cannot establish that — it only held while the
+    /// reader was slow enough never to build a backlog.
     public var notificationsDelivered: Int {
-        notificationsYielded
+        receiveLock.lock()
+        defer { receiveLock.unlock() }
+        return notificationsYielded
     }
 
     public var debugMessages: AsyncStream<DebugMessage>? {
@@ -129,13 +165,40 @@ public actor Client {
         debugStream = AsyncStream { cont in
             continuation = cont
         }
-        debugContinuation = continuation
+        setDebugContinuation(continuation)
     }
 
     public func disableDebugStream() {
-        debugContinuation?.finish()
-        debugContinuation = nil
+        setDebugContinuation(nil)?.finish()
         debugStream = nil
+    }
+
+    /// Swaps the debug continuation under the receive lock, returning the
+    /// old one for its finish.
+    @discardableResult
+    nonisolated private func setDebugContinuation(
+        _ continuation: AsyncStream<DebugMessage>.Continuation?
+    ) -> AsyncStream<DebugMessage>.Continuation? {
+        receiveLock.lock()
+        defer { receiveLock.unlock() }
+        let previous = debugContinuation
+        debugContinuation = continuation
+        return previous
+    }
+
+    nonisolated private func currentDebugContinuation() -> AsyncStream<DebugMessage>.Continuation? {
+        receiveLock.lock()
+        defer { receiveLock.unlock() }
+        return debugContinuation
+    }
+
+    /// The closed sink, taken so it fires exactly once.
+    nonisolated private func takeClosedSink() -> (@Sendable () -> Void)? {
+        receiveLock.lock()
+        defer { receiveLock.unlock() }
+        let sink = closedSink
+        closedSink = nil
+        return sink
     }
 
     /// The running agent process identifier, when this client launched one.
@@ -1027,21 +1090,29 @@ public actor Client {
         failAllRequests(error: ClientError.processNotRunning)
 
         notificationContinuation.finish()
-        debugContinuation?.finish()
-        debugContinuation = nil
+        setDebugContinuation(nil)?.finish()
         debugStream = nil
+        takeClosedSink()?()
     }
 
     // MARK: - Private Methods
 
-    private func handleMessage(data: Data) async {
+    /// THE RECEIVE PATH, on the process reader's queue (2026-09-04): every
+    /// frame is classified HERE, and a notification — counted first, then
+    /// handed to the installed handler or yielded to the stream — never
+    /// leaves this thread. The path this replaces awaited this actor per
+    /// message, yielded to a stream a consumer task resumed on, and hopped
+    /// onto the router's actor for every notification, a check that
+    /// returns for all but two methods. Responses and agent requests still
+    /// hop to the actor, one task each; both are rare by nature.
+    nonisolated private func receive(_ data: Data) {
         // A byte test, not a String decode plus a whitespace trim: both were
         // full passes over the message, paid before the decoder even ran.
         guard data.contains(where: { $0 != 0x20 && $0 != 0x09 && $0 != 0x0D && $0 != 0x0A }) else {
             return
         }
 
-        if let continuation = debugContinuation {
+        if let continuation = currentDebugContinuation() {
             let method = extractMethod(from: data)
             continuation.yield(DebugMessage(
                 direction: .incoming,
@@ -1061,28 +1132,25 @@ public actor Client {
             // replay). Requests, responses, and anything the envelope cannot
             // classify — a malformed id — take the full decode as before,
             // whose own rule still reads `"id": null` as a notification.
-            if let envelope = try? decoder.decode(MessageEnvelope.self, from: data),
+            if let envelope = try? receiveDecoder.decode(MessageEnvelope.self, from: data),
                let method = envelope.method, envelope.id == nil {
-                let notification = JSONRPCNotification(method: method, rawData: data)
-                notificationsYielded += 1
-                notificationContinuation.yield(notification)
-                await handleIncomingNotification(notification)
+                deliver(JSONRPCNotification(method: method, rawData: data))
                 return
             }
 
-            let message = try decoder.decode(Message.self, from: data)
+            let message = try receiveDecoder.decode(Message.self, from: data)
 
             switch message {
             case .response(let response):
-                await handleResponse(response)
+                Task { [weak self] in
+                    await self?.handleResponse(response)
+                }
 
             case .notification(var notification):
                 // The bytes ride along, so a consumer decodes its typed
                 // payload once from them instead of round-tripping `params`.
                 notification.rawData = data
-                notificationsYielded += 1
-                notificationContinuation.yield(notification)
-                await handleIncomingNotification(notification)
+                deliver(notification)
 
             case .request(let request):
                 Task { [weak self] in
@@ -1094,6 +1162,27 @@ public actor Client {
                 logger.warning("Failed to parse message: \(error.localizedDescription)\nData: \(text.prefix(500))")
             } else {
                 logger.warning("Failed to parse message: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Counts the notification, then hands it to the installed handler —
+    /// or, with none, to the stream — still on the reader's queue. The
+    /// router's actor is entered only for the two notification methods it
+    /// routes, instead of for every notification.
+    nonisolated private func deliver(_ notification: JSONRPCNotification) {
+        receiveLock.lock()
+        notificationsYielded += 1
+        let sink = notificationSink
+        receiveLock.unlock()
+        if let sink {
+            sink(notification)
+        } else {
+            notificationContinuation.yield(notification)
+        }
+        if Self.routedNotificationMethods.contains(notification.method) {
+            Task { [weak self] in
+                await self?.handleIncomingNotification(notification)
             }
         }
     }
@@ -1167,6 +1256,9 @@ public actor Client {
         failAllRequests(error: ClientError.processFailed(exitCode))
 
         notificationContinuation.finish()
+        // After the last notification by construction: the process manager
+        // drained the pipes on the reader's queue before calling here.
+        takeClosedSink()?()
     }
 
     private func failRequest(id: RequestId, error: Error) async {
@@ -1193,7 +1285,7 @@ public actor Client {
         earlyResponses.removeAll()
     }
 
-    private func extractMethod(from data: Data) -> String? {
+    nonisolated private func extractMethod(from data: Data) -> String? {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
@@ -1201,7 +1293,7 @@ public actor Client {
     }
 
     private func writeMessageWithDebug<T: Encodable>(_ message: T, method: String? = nil) async throws {
-        if let continuation = debugContinuation {
+        if let continuation = currentDebugContinuation() {
             if let data = try? encoder.encode(message) {
                 continuation.yield(DebugMessage(
                     direction: .outgoing,

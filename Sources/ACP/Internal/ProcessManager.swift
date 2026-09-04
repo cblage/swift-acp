@@ -20,35 +20,20 @@ actor ACPProcessManager {
     private var stdoutPipe: Pipe?
     private var stderrPipe: Pipe?
     private var stdinDescriptor: Int32 = -1
-
-    private var readBuffer: Data = Data()
-    /// Bytes of `readBuffer` already handed out — ADVANCED, never shifted
-    /// out with `removeFirst`, and compacted only once they dominate the
-    /// buffer, so consuming a message costs its own length, amortised.
-    private var readOffset = 0
-    /// The framer's position and state, kept ACROSS chunks: a message that
-    /// arrives in pieces is scanned once, resuming where the last chunk
-    /// ended. The old framer copied the whole buffer into an array and
-    /// rescanned it from byte zero on every chunk, so a large frame cost
-    /// its size squared and a session's reader task ran flat out for the
-    /// length of a stream.
-    private var scanIndex = 0
-    private var scanDepth = 0
-    private var scanInString = false
-    private var scanEscaped = false
-    private var largeBufferDumpCount: Int = 0
-    private var lastLargeBufferDumpSize: Int = 0
+    /// The running process's stdout and stderr, read and framed on the
+    /// reader's own serial queue — see `ACPOutputReader`.
+    private var reader: ACPOutputReader?
 
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
     private let logger: Logger
 
-    private static let largeBufferWarningThreshold = 200000
-    private static let largeBufferDumpMinGrowth = 8192
-    private static let maxLargeBufferDumps = 3
-
-    private var onDataReceived: ((Data) async -> Void)?
-    private var onTermination: ((Int32) async -> Void)?
+    /// The handlers cross to the reader's queue and are installed by the
+    /// client at its own construction, before any launch, so they live
+    /// under a lock rather than on the actor.
+    private let handlerLock = NSLock()
+    nonisolated(unsafe) private var onMessage: (@Sendable (Data) -> Void)?
+    nonisolated(unsafe) private var onTermination: (@Sendable (Int32) async -> Void)?
 
     /// Stdin writes run HERE, never on the actor: a write to a full pipe
     /// blocks until the agent reads, and an agent busy emitting a replay
@@ -59,16 +44,8 @@ actor ACPProcessManager {
     /// transcript stalled. A serial queue keeps the writes ordered.
     private let writeQueue = DispatchQueue(label: "org.acp.process.stdin")
 
-    private enum OutputChunk: Sendable {
-        case stdout(Data)
-        case stderr(Data)
-    }
-
-    private var outputContinuation: AsyncStream<OutputChunk>.Continuation?
-    private var outputConsumerTask: Task<Void, Never>?
     private var stderrLineContinuation: AsyncStream<String>.Continuation?
     private var stderrLineStream: AsyncStream<String>?
-    private var stderrBuffer = Data()
 
     // MARK: - Initialization
 
@@ -191,9 +168,23 @@ actor ACPProcessManager {
             }
         }
 
-        startOutputProcessing()
-        startReading()
-        startReadingStderr()
+        var stderrContinuation: AsyncStream<String>.Continuation!
+        stderrLineStream = AsyncStream { stderrContinuation = $0 }
+        stderrLineContinuation = stderrContinuation
+        let lines = stderrContinuation!
+
+        handlerLock.lock()
+        let onMessage = self.onMessage
+        handlerLock.unlock()
+        let reader = ACPOutputReader(
+            stdout: stdout.fileHandleForReading,
+            stderr: stderr.fileHandleForReading,
+            logger: logger,
+            onMessage: { data in onMessage?(data) },
+            onStderrLine: { line in lines.yield(line) }
+        )
+        self.reader = reader
+        reader.start()
     }
 
     func isRunning() -> Bool {
@@ -222,15 +213,20 @@ actor ACPProcessManager {
         let pgid = processGroupId
         let pid = proc?.processIdentifier
 
-        stdoutPipe?.fileHandleForReading.readabilityHandler = nil
-        stderrPipe?.fileHandleForReading.readabilityHandler = nil
-
         stdinDescriptor = -1
         try? stdinPipe?.fileHandleForWriting.close()
-        try? stdoutPipe?.fileHandleForReading.close()
-        try? stderrPipe?.fileHandleForReading.close()
 
-        await finishOutputProcessing()
+        // A terminate discards what the agent was still saying: the reader
+        // stops without draining, and its sources close the read ends on
+        // their own queue once they have cancelled — never here, since
+        // closing a descriptor a source still monitors is undefined.
+        if let reader {
+            await reader.stop()
+            self.reader = nil
+        }
+        stderrLineContinuation?.finish()
+        stderrLineContinuation = nil
+        stderrLineStream = nil
 
         if let proc, proc.isRunning {
             if let pgid {
@@ -257,8 +253,6 @@ actor ACPProcessManager {
         stdinPipe = nil
         stdoutPipe = nil
         stderrPipe = nil
-
-        resetReadState()
     }
 
     // MARK: - I/O Operations
@@ -308,77 +302,232 @@ actor ACPProcessManager {
 
     // MARK: - Callbacks
 
-    func setDataReceivedCallback(_ callback: @escaping (Data) async -> Void) {
-        self.onDataReceived = callback
-    }
-
-    func setTerminationCallback(_ callback: @escaping (Int32) async -> Void) {
-        self.onTermination = callback
+    /// Installs the receive and termination handlers. `onMessage` is called
+    /// SYNCHRONOUSLY on the reader's queue with each complete frame, in
+    /// order; `onTermination` runs on this actor once every frame the pipes
+    /// still held has been delivered.
+    nonisolated func setHandlers(
+        onMessage: @escaping @Sendable (Data) -> Void,
+        onTermination: @escaping @Sendable (Int32) async -> Void
+    ) {
+        handlerLock.lock()
+        self.onMessage = onMessage
+        self.onTermination = onTermination
+        handlerLock.unlock()
     }
 
     // MARK: - Private Methods
 
-    private func startOutputProcessing() {
-        var stderrContinuation: AsyncStream<String>.Continuation!
-        stderrLineStream = AsyncStream { stderrContinuation = $0 }
-        stderrLineContinuation = stderrContinuation
-        stderrBuffer.removeAll(keepingCapacity: true)
-
-        var outputContinuation: AsyncStream<OutputChunk>.Continuation!
-        let outputStream = AsyncStream<OutputChunk>(bufferingPolicy: .unbounded) {
-            outputContinuation = $0
+    private func handleTermination(exitCode: Int32) async {
+        let pid = process?.processIdentifier
+        let pgid = processGroupId
+        // ORDERED AFTER THE LAST MESSAGE: the reader drains both pipes to
+        // EOF on its own queue, delivering every frame still in them and
+        // the framer's remainder, before this resumes — so the termination
+        // callback below can never overtake output the agent wrote before
+        // it exited.
+        if let reader {
+            await reader.finish()
+            self.reader = nil
         }
-        self.outputContinuation = outputContinuation
-        outputConsumerTask = Task { [weak self] in
-            for await chunk in outputStream {
-                guard let self else { return }
-                await self.processOutput(chunk)
+        stderrLineContinuation?.finish()
+        stderrLineContinuation = nil
+        stderrLineStream = nil
+
+        stdinDescriptor = -1
+        try? stdinPipe?.fileHandleForWriting.close()
+        stdinPipe = nil
+        stdoutPipe = nil
+        stderrPipe = nil
+        process = nil
+        processGroupId = nil
+
+        logger.info("Agent process terminated with code: \(exitCode)")
+        await ProcessRegistry.shared.removeProcess(pid: pid, pgid: pgid)
+        handlerLock.lock()
+        let onTermination = self.onTermination
+        handlerLock.unlock()
+        await onTermination?(exitCode)
+    }
+
+    private func waitForExit(_ proc: Process, timeout: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while proc.isRunning, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return !proc.isRunning
+    }
+}
+
+/// The agent's stdout and stderr, read and FRAMED on ONE serial queue with
+/// no stream, no consumer task, and no actor hop per message (2026-09-04).
+/// A dispatch read source per pipe fires on the queue, the framer walks the
+/// bytes on that thread, and every complete frame goes to `onMessage`
+/// SYNCHRONOUSLY, still on the queue. The path this replaces yielded each
+/// chunk into an unbounded stream, resumed a consumer task, hopped onto the
+/// process actor to frame, and hopped onto the client actor per message —
+/// three cooperative-pool schedulings per notification, tens of thousands
+/// per replay, competing with every other task the pool ran.
+///
+/// Queue-confined by construction: every stored property below is touched
+/// only on `queue`. The pipes are NON-BLOCKING, so the final drain at
+/// termination reads to EOF without ever parking the queue on a write end
+/// a grandchild inherited, and the read handles close in the sources'
+/// cancel handlers — the one point past which a source is done with its
+/// descriptor — never from the actor.
+final class ACPOutputReader: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "org.acp.process.read", qos: .userInitiated)
+    private let stdout: FileHandle
+    private let stderr: FileHandle
+    private let logger: Logger
+    private let onMessage: @Sendable (Data) -> Void
+    private let onStderrLine: @Sendable (String) -> Void
+
+    // Confined to `queue` from here on.
+    private var stdoutSource: DispatchSourceRead?
+    private var stderrSource: DispatchSourceRead?
+    private var stdoutOpen = true
+    private var stderrOpen = true
+    private var ended = false
+    private var chunk = [UInt8](repeating: 0, count: 65536)
+
+    private var readBuffer = Data()
+    /// Bytes of `readBuffer` already handed out — ADVANCED, never shifted
+    /// out with `removeFirst`, and compacted only once they dominate the
+    /// buffer, so consuming a message costs its own length, amortised.
+    private var readOffset = 0
+    /// The framer's position and state, kept ACROSS chunks: a message that
+    /// arrives in pieces is scanned once, resuming where the last chunk
+    /// ended. The old framer copied the whole buffer into an array and
+    /// rescanned it from byte zero on every chunk, so a large frame cost
+    /// its size squared and a session's reader task ran flat out for the
+    /// length of a stream.
+    private var scanIndex = 0
+    private var scanDepth = 0
+    private var scanInString = false
+    private var scanEscaped = false
+    private var stderrBuffer = Data()
+
+    private static let largeBufferWarningThreshold = 200000
+
+    init(
+        stdout: FileHandle,
+        stderr: FileHandle,
+        logger: Logger,
+        onMessage: @escaping @Sendable (Data) -> Void,
+        onStderrLine: @escaping @Sendable (String) -> Void
+    ) {
+        self.stdout = stdout
+        self.stderr = stderr
+        self.logger = logger
+        self.onMessage = onMessage
+        self.onStderrLine = onStderrLine
+    }
+
+    func start() {
+        queue.async { [self] in
+            stdoutSource = makeSource(stdout, isStdout: true)
+            stderrSource = makeSource(stderr, isStdout: false)
+        }
+    }
+
+    /// Termination: drains both pipes to EOF, delivers every frame still in
+    /// them and the framer's remainder, cancels the sources, and resumes —
+    /// all on the read queue, so a caller's own termination handling that
+    /// follows this is ordered after the last message.
+    func finish() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            queue.async { [self] in
+                if !ended {
+                    ended = true
+                    _ = drain(isStdout: true)
+                    _ = drain(isStdout: false)
+                    flushRemainder()
+                    cancelSources()
+                }
+                continuation.resume()
             }
         }
     }
 
-    private func startReading() {
-        guard let stdout = stdoutPipe?.fileHandleForReading,
-              let outputContinuation else { return }
-
-        stdout.readabilityHandler = { handle in
-            let data = handle.availableData
-
-            guard !data.isEmpty else {
-                handle.readabilityHandler = nil
-                return
+    /// A terminate: stops reading without draining, the sources closing the
+    /// read handles as they cancel.
+    func stop() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            queue.async { [self] in
+                if !ended {
+                    ended = true
+                    cancelSources()
+                }
+                continuation.resume()
             }
-
-            outputContinuation.yield(.stdout(data))
         }
     }
 
-    private func startReadingStderr() {
-        guard let stderr = stderrPipe?.fileHandleForReading,
-              let outputContinuation else { return }
-
-        stderr.readabilityHandler = { handle in
-            let data = handle.availableData
-            guard !data.isEmpty else {
-                handle.readabilityHandler = nil
-                return
+    private func makeSource(_ handle: FileHandle, isStdout: Bool) -> DispatchSourceRead {
+        let fd = handle.fileDescriptor
+        _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+        source.setEventHandler { [weak self] in
+            guard let self else { return }
+            if self.drain(isStdout: isStdout) {
+                // EOF: the writer is gone; nothing more will ever arrive.
+                (isStdout ? self.stdoutSource : self.stderrSource)?.cancel()
             }
-            outputContinuation.yield(.stderr(data))
+        }
+        source.setCancelHandler { [weak self] in
+            try? handle.close()
+            guard let self else { return }
+            if isStdout { self.stdoutOpen = false } else { self.stderrOpen = false }
+        }
+        source.resume()
+        return source
+    }
+
+    private func cancelSources() {
+        stdoutSource?.cancel()
+        stderrSource?.cancel()
+        stdoutSource = nil
+        stderrSource = nil
+    }
+
+    /// Reads until the pipe holds nothing more right now, or is at EOF —
+    /// true at EOF. Non-blocking by the flag set at the source's creation.
+    private func drain(isStdout: Bool) -> Bool {
+        guard isStdout ? stdoutOpen : stderrOpen else { return true }
+        let fd = (isStdout ? stdout : stderr).fileDescriptor
+        guard fd >= 0 else { return true }
+        while true {
+            let count = chunk.withUnsafeMutableBytes { raw -> Int in
+                guard let base = raw.baseAddress else { return 0 }
+                return Darwin.read(fd, base, raw.count)
+            }
+            if count > 0 {
+                let data = chunk.withUnsafeBytes { raw in
+                    Data(bytes: raw.baseAddress!, count: count)
+                }
+                if isStdout {
+                    receiveStdout(data)
+                } else {
+                    receiveStderr(data)
+                }
+                continue
+            }
+            if count == 0 { return true }
+            if errno == EINTR { continue }
+            return false
         }
     }
 
-    private func processOutput(_ chunk: OutputChunk) async {
-        switch chunk {
-        case .stdout(let data):
-            await processIncomingData(data)
-        case .stderr(let data):
-            processStderrData(data)
+    private func receiveStdout(_ data: Data) {
+        readBuffer.append(data)
+        while let message = popNextMessage() {
+            onMessage(message)
         }
     }
 
-    private func processStderrData(_ data: Data) {
+    private func receiveStderr(_ data: Data) {
         stderrBuffer.append(data)
-
         while let newlineIndex = stderrBuffer.firstIndex(of: 0x0A) {
             var line = Data(stderrBuffer[..<newlineIndex])
             let removeCount = stderrBuffer.distance(from: stderrBuffer.startIndex, to: newlineIndex) + 1
@@ -386,94 +535,28 @@ actor ACPProcessManager {
             if line.last == 0x0D {
                 line.removeLast()
             }
-            stderrLineContinuation?.yield(String(decoding: line, as: UTF8.self))
+            onStderrLine(String(decoding: line, as: UTF8.self))
         }
     }
 
-    private func finishOutputProcessing() async {
-        outputContinuation?.finish()
-        if let outputConsumerTask {
-            await outputConsumerTask.value
+    /// The bytes that never closed into a message go out as one final
+    /// frame, so the client logs a malformed tail instead of dropping it
+    /// silently; a partial stderr line goes out as a line.
+    private func flushRemainder() {
+        let remaining = readBuffer.count > readOffset
+            ? readBuffer.subdata(in: readOffset..<readBuffer.count)
+            : Data()
+        resetReadState()
+        if !remaining.isEmpty {
+            onMessage(remaining)
         }
-        outputConsumerTask = nil
-        outputContinuation = nil
-
         if !stderrBuffer.isEmpty {
-            stderrLineContinuation?.yield(String(decoding: stderrBuffer, as: UTF8.self))
+            onStderrLine(String(decoding: stderrBuffer, as: UTF8.self))
             stderrBuffer.removeAll(keepingCapacity: true)
         }
-        stderrLineContinuation?.finish()
-        stderrLineContinuation = nil
-        stderrLineStream = nil
-    }
-
-    private func processIncomingData(_ data: Data) async {
-        readBuffer.append(data)
-
-        await drainBufferedMessages()
-    }
-
-    private func handleTermination(exitCode: Int32) async {
-        let pid = process?.processIdentifier
-        let pgid = processGroupId
-        await drainAndClosePipes()
-        logger.info("Agent process terminated with code: \(exitCode)")
-        await ProcessRegistry.shared.removeProcess(pid: pid, pgid: pgid)
-        await onTermination?(exitCode)
-    }
-
-    private func drainAndClosePipes() async {
-        if let stdoutHandle = stdoutPipe?.fileHandleForReading {
-            stdoutHandle.readabilityHandler = nil
-            do {
-                while true {
-                    guard let chunk = try stdoutHandle.read(upToCount: 65536), !chunk.isEmpty else {
-                        break
-                    }
-                    outputContinuation?.yield(.stdout(chunk))
-                }
-            } catch {
-                // Handle already closed or invalid file handles safely
-            }
-            try? stdoutHandle.close()
-        }
-
-        if let stderrHandle = stderrPipe?.fileHandleForReading {
-            stderrHandle.readabilityHandler = nil
-            do {
-                while true {
-                    guard let chunk = try stderrHandle.read(upToCount: 65536), !chunk.isEmpty else {
-                        break
-                    }
-                    outputContinuation?.yield(.stderr(chunk))
-                }
-            } catch {
-                // Handle already closed or invalid file handles safely
-            }
-            try? stderrHandle.close()
-        }
-
-        await finishOutputProcessing()
-        await flushRemainingBufferIfNeeded()
-
-        stdinDescriptor = -1
-        try? stdinPipe?.fileHandleForWriting.close()
-
-        stdinPipe = nil
-        stdoutPipe = nil
-        stderrPipe = nil
-        process = nil
-        processGroupId = nil
-        resetReadState()
     }
 
     // MARK: - JSON Message Parsing
-
-    private func drainBufferedMessages() async {
-        while let message = popNextMessage() {
-            await onDataReceived?(message)
-        }
-    }
 
     /// One complete top-level JSON value from the front of the buffer, or nil
     /// while the buffer holds none. INCREMENTAL: the scanner's index and
@@ -528,7 +611,7 @@ actor ACPProcessManager {
             var end: Int?
             var malformedLineEnd: Int?
             // The walk runs on LOCALS and writes the state back once: every
-            // actor property access is a dynamic exclusivity check, and the
+            // stored-property access is a dynamic exclusivity check, and the
             // first cut paid three or four of them per byte — slower per
             // byte than the buffer copy it replaced.
             var index = scanIndex
@@ -633,26 +716,6 @@ actor ACPProcessManager {
         scanDepth = 0
         scanInString = false
         scanEscaped = false
-    }
-
-    private func flushRemainingBufferIfNeeded() async {
-        await drainBufferedMessages()
-
-        let remaining = readBuffer.count > readOffset
-            ? readBuffer.subdata(in: readOffset..<readBuffer.count)
-            : Data()
-        resetReadState()
-        if !remaining.isEmpty {
-            await onDataReceived?(remaining)
-        }
-    }
-
-    private func waitForExit(_ proc: Process, timeout: TimeInterval) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        while proc.isRunning, Date() < deadline {
-            try? await Task.sleep(nanoseconds: 50_000_000)
-        }
-        return !proc.isRunning
     }
 }
 #endif
