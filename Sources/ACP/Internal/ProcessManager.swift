@@ -42,7 +42,7 @@ actor ACPProcessManager {
     /// — a 2026-09-03 profile showed model and effort requests parked
     /// 14–32s in the write while the reader waited on the actor and the
     /// transcript stalled. A serial queue keeps the writes ordered.
-    private let writeQueue = DispatchQueue(label: "org.acp.process.stdin", qos: .utility)
+    private let writeQueue = DispatchQueue(label: "org.acp.process.stdin")
 
     private var stderrLineContinuation: AsyncStream<String>.Continuation?
     private var stderrLineStream: AsyncStream<String>?
@@ -273,8 +273,7 @@ actor ACPProcessManager {
         // handle closed under a blocked write surfaces as an error here
         // instead of a hang.
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            // `.utility`, enforced: the write must not inherit the caller's band.
-            writeQueue.async(qos: .utility, flags: .enforceQoS) {
+            writeQueue.async {
                 // A raw write to a pipe whose reader has died raises SIGPIPE
                 // for the whole process; the descriptor opts out so a dead
                 // agent reads as EPIPE, the error path, not a kill.
@@ -377,9 +376,7 @@ actor ACPProcessManager {
 /// cancel handlers — the one point past which a source is done with its
 /// descriptor — never from the actor.
 final class ACPOutputReader: @unchecked Sendable {
-    /// `.utility`, and enforced on the read handler: the intake must not
-    /// contend with the frame.
-    private let queue = DispatchQueue(label: "org.acp.process.read", qos: .utility)
+    private let queue = DispatchQueue(label: "org.acp.process.read", qos: .userInitiated)
     private let stdout: FileHandle
     private let stderr: FileHandle
     private let logger: Logger
@@ -471,7 +468,7 @@ final class ACPOutputReader: @unchecked Sendable {
         let fd = handle.fileDescriptor
         _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
-        source.setEventHandler(qos: .utility, flags: .enforceQoS) { [weak self] in
+        source.setEventHandler { [weak self] in
             guard let self else { return }
             if self.drain(isStdout: isStdout) {
                 // EOF: the writer is gone; nothing more will ever arrive.
