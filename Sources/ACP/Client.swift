@@ -89,7 +89,12 @@ public actor Client {
 
     // MARK: - Initialization
 
-    public init() {
+    /// `qos` is the INTAKE'S BAND (2026-09-06): the process's read queue,
+    /// its read handlers, and every stdin write are created at it and, when
+    /// one is given, enforce it — the library bakes no quality of service
+    /// of its own, the app decides per client. `.unspecified` leaves plain
+    /// queues and plain handlers.
+    public init(qos: DispatchQoS = .unspecified) {
         decoder = JSONDecoder()
         encoder = JSONEncoder()
         encoder.outputFormatting = [.withoutEscapingSlashes]
@@ -100,7 +105,7 @@ public actor Client {
         }
         notificationContinuation = continuation
 
-        processManager = ACPProcessManager(encoder: encoder, decoder: decoder)
+        processManager = ACPProcessManager(encoder: encoder, decoder: decoder, qos: qos)
         requestRouter = ACPRequestRouter(encoder: encoder, decoder: decoder)
         errorHandler = ErrorHandler(encoder: encoder)
 

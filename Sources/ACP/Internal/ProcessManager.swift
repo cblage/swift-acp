@@ -42,17 +42,28 @@ actor ACPProcessManager {
     /// — a 2026-09-03 profile showed model and effort requests parked
     /// 14–32s in the write while the reader waited on the actor and the
     /// transcript stalled. A serial queue keeps the writes ordered.
-    private let writeQueue = DispatchQueue(label: "org.acp.process.stdin")
+    /// THE INTAKE'S QoS COMES FROM THE APP at the client's construction
+    /// (2026-09-06): the library bakes no band into its queues. This queue
+    /// and the reader's are created at `qos`, and when one is given every
+    /// write and every read handler ENFORCES it, so neither inherits the
+    /// band its submitter happened to carry; `.unspecified` leaves plain
+    /// queues and plain handlers.
+    private let qos: DispatchQoS
+    private let enforced: DispatchWorkItemFlags
+    private let writeQueue: DispatchQueue
 
     private var stderrLineContinuation: AsyncStream<String>.Continuation?
     private var stderrLineStream: AsyncStream<String>?
 
     // MARK: - Initialization
 
-    init(encoder: JSONEncoder, decoder: JSONDecoder) {
+    init(encoder: JSONEncoder, decoder: JSONDecoder, qos: DispatchQoS) {
         self.encoder = encoder
         self.decoder = decoder
         self.logger = Logger.forCategory("ACPProcessManager")
+        self.qos = qos
+        self.enforced = qos == .unspecified ? [] : [.enforceQoS]
+        self.writeQueue = DispatchQueue(label: "org.acp.process.stdin", qos: qos)
     }
 
     // MARK: - Process Lifecycle
@@ -180,6 +191,7 @@ actor ACPProcessManager {
             stdout: stdout.fileHandleForReading,
             stderr: stderr.fileHandleForReading,
             logger: logger,
+            qos: qos,
             onMessage: { data in onMessage?(data) },
             onStderrLine: { line in lines.yield(line) }
         )
@@ -273,7 +285,9 @@ actor ACPProcessManager {
         // handle closed under a blocked write surfaces as an error here
         // instead of a hang.
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            writeQueue.async {
+            // The app's band, enforced when one was given: the write holds
+            // the intake's QoS whatever the submitter's.
+            writeQueue.async(qos: qos, flags: enforced) {
                 // A raw write to a pipe whose reader has died raises SIGPIPE
                 // for the whole process; the descriptor opts out so a dead
                 // agent reads as EPIPE, the error path, not a kill.
@@ -376,7 +390,13 @@ actor ACPProcessManager {
 /// cancel handlers — the one point past which a source is done with its
 /// descriptor — never from the actor.
 final class ACPOutputReader: @unchecked Sendable {
-    private let queue = DispatchQueue(label: "org.acp.process.read", qos: .userInitiated)
+    /// Created at the APP'S band (`qos`, from the client's construction —
+    /// see `ACPProcessManager.qos`); the read handlers enforce it when one
+    /// was given, so a frame never runs at whatever the source happened to
+    /// inherit. The library bakes no band of its own.
+    private let queue: DispatchQueue
+    private let qos: DispatchQoS
+    private let enforced: DispatchWorkItemFlags
     private let stdout: FileHandle
     private let stderr: FileHandle
     private let logger: Logger
@@ -414,12 +434,16 @@ final class ACPOutputReader: @unchecked Sendable {
         stdout: FileHandle,
         stderr: FileHandle,
         logger: Logger,
+        qos: DispatchQoS,
         onMessage: @escaping @Sendable (Data) -> Void,
         onStderrLine: @escaping @Sendable (String) -> Void
     ) {
         self.stdout = stdout
         self.stderr = stderr
         self.logger = logger
+        self.qos = qos
+        self.enforced = qos == .unspecified ? [] : [.enforceQoS]
+        self.queue = DispatchQueue(label: "org.acp.process.read", qos: qos)
         self.onMessage = onMessage
         self.onStderrLine = onStderrLine
     }
@@ -468,7 +492,8 @@ final class ACPOutputReader: @unchecked Sendable {
         let fd = handle.fileDescriptor
         _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
-        source.setEventHandler { [weak self] in
+        // The app's band, enforced when one was given — see `qos`.
+        source.setEventHandler(qos: qos, flags: enforced) { [weak self] in
             guard let self else { return }
             if self.drain(isStdout: isStdout) {
                 // EOF: the writer is gone; nothing more will ever arrive.
