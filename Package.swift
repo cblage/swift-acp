@@ -16,7 +16,7 @@ let package = Package(
         .library(name: "ACPRegistry", targets: ["ACPRegistry"])
     ],
     dependencies: [
-        .package(url: "https://github.com/mattt/swift-yyjson.git", from: "0.6.0", traits: ["strictStandardJSON"])
+        .package(url: "https://github.com/mattt/swift-yyjson.git", from: "0.6.0")
     ],
     targets: [
         // Core model types (platform-independent)
