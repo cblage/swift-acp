@@ -289,8 +289,8 @@ extension EmbeddedResourceType {
 
 extension ContentBlock {
     public func toDictionary() -> [String: any Sendable] {
-        guard let data = try? YYJSONEncoder().encode(self),
-              let object = try? YYJSONSerialization.jsonObject(with: data),
+        guard let data = try? ACPJSONEncoder().encode(self),
+              let object = try? ACPJSONSerialization.jsonObject(with: data),
               let dict = object as? [String: any Sendable] else {
             return [:]
         }

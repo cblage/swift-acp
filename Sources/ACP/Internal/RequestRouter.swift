@@ -15,8 +15,8 @@ actor ACPRequestRouter {
     /// The router's own coders: the yyjson coders are value types that are
     /// not `Sendable`, so each actor builds its pair instead of sharing
     /// the client's.
-    private let encoder = YYJSONEncoder()
-    private let decoder = YYJSONDecoder()
+    private let encoder = ACPJSONEncoder()
+    private let decoder = ACPJSONDecoder()
 
     weak var delegate: ClientDelegate?
 

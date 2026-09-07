@@ -17,7 +17,7 @@ actor ErrorHandler {
 
     /// Its own encoder, like every actor here: the yyjson coders are value
     /// types that are not `Sendable`.
-    private let encoder = YYJSONEncoder()
+    private let encoder = ACPJSONEncoder()
 
     // MARK: - Initialization
 

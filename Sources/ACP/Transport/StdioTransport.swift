@@ -31,7 +31,7 @@ public actor StdioTransport: Transport {
     private var stdoutContinuation: AsyncStream<Data>.Continuation?
     private var stdoutConsumerTask: Task<Void, Never>?
 
-    private let encoder: YYJSONEncoder
+    private let encoder: ACPJSONEncoder
 
     // MARK: - Transport Protocol
 
@@ -48,7 +48,7 @@ public actor StdioTransport: Transport {
     public init(configuration: TransportConfiguration = .default) {
         self.configuration = configuration
         self.logger = Logger.forCategory("StdioTransport")
-        self.encoder = YYJSONEncoder()
+        self.encoder = ACPJSONEncoder()
 
         var continuation: AsyncStream<Data>.Continuation!
         self.messageStream = AsyncStream { cont in

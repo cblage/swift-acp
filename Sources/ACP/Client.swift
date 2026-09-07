@@ -75,8 +75,8 @@ public actor Client {
     /// `Sendable`, so the router, the error handler, and the read queue
     /// each build theirs instead of sharing these. The writer escapes no
     /// slash by default, which is what Foundation's needed telling.
-    private let decoder: YYJSONDecoder
-    private let encoder: YYJSONEncoder
+    private let decoder: ACPJSONDecoder
+    private let encoder: ACPJSONEncoder
 
     public weak var delegate: ClientDelegate?
 
@@ -88,8 +88,8 @@ public actor Client {
     /// of its own, the app decides per client. `.unspecified` leaves plain
     /// queues and plain handlers.
     public init(qos: DispatchQoS = .unspecified) {
-        decoder = YYJSONDecoder()
-        encoder = YYJSONEncoder()
+        decoder = ACPJSONDecoder()
+        encoder = ACPJSONEncoder()
 
         var continuation: AsyncStream<JSONRPCNotification>.Continuation!
         notificationStream = AsyncStream { cont in
@@ -1140,7 +1140,7 @@ public actor Client {
 
             // The read queue's own decoder, built per frame on this path —
             // a value type of options, its cost is in the decode.
-            let message = try YYJSONDecoder().decode(Message.self, from: data)
+            let message = try ACPJSONDecoder().decode(Message.self, from: data)
 
             switch message {
             case .response(let response):
@@ -1288,7 +1288,7 @@ public actor Client {
     }
 
     nonisolated private func extractMethod(from data: Data) -> String? {
-        guard let json = try? YYJSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        guard let json = try? ACPJSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
         return json["method"] as? String

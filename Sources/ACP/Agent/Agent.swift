@@ -212,8 +212,8 @@ public actor Agent {
 
     private let transport: any Transport
     private let logger: Logger
-    private let encoder: YYJSONEncoder
-    private let decoder: YYJSONDecoder
+    private let encoder: ACPJSONEncoder
+    private let decoder: ACPJSONDecoder
 
     private weak var delegate: AgentDelegate?
     private var pendingRequests: [RequestId: CheckedContinuation<JSONRPCResponse, Error>] = [:]
@@ -234,8 +234,8 @@ public actor Agent {
     public init(transport: any Transport) {
         self.transport = transport
         self.logger = Logger.forCategory("Agent")
-        self.encoder = YYJSONEncoder()
-        self.decoder = YYJSONDecoder()
+        self.encoder = ACPJSONEncoder()
+        self.decoder = ACPJSONDecoder()
 
         var continuation: AsyncStream<AgentRequest>.Continuation!
         self.requestStream = AsyncStream { cont in

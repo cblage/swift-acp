@@ -96,7 +96,7 @@ public struct JSONRPCNotification: Codable, Sendable {
     public var params: AnyCodable? {
         if let storedParams { return storedParams }
         guard decodesParamsLazily, let rawData else { return nil }
-        return try? YYJSONDecoder().decode(ParamsEnvelope.self, from: rawData).params
+        return try? ACPJSONDecoder().decode(ParamsEnvelope.self, from: rawData).params
     }
     private let storedParams: AnyCodable?
     private let decodesParamsLazily: Bool

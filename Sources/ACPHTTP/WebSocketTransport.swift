@@ -122,14 +122,14 @@ public actor WebSocketTransport: Transport {
 public actor WebSocketClient {
     private let transport: WebSocketTransport
     private let client: Client
-    private let decoder: YYJSONDecoder
-    private let encoder: YYJSONEncoder
+    private let decoder: ACPJSONDecoder
+    private let encoder: ACPJSONEncoder
 
     public init(url: URL) {
         self.transport = WebSocketTransport(url: url)
         self.client = Client()
-        self.decoder = YYJSONDecoder()
-        self.encoder = YYJSONEncoder()
+        self.decoder = ACPJSONDecoder()
+        self.encoder = ACPJSONEncoder()
     }
 
     /// Connect to the WebSocket server and initialize the client
