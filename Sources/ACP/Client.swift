@@ -70,16 +70,6 @@ public actor Client {
     /// — the only ones worth a hop onto its actor.
     private static let routedNotificationMethods: Set<String> = ["mcp/message", "elicitation/complete"]
 
-    /// The receive path's classifier: `method` names a request or a
-    /// notification, `id` tells them apart, and a `null` id reads as absent
-    /// — the same rule `Message` applies. An id that decodes as neither
-    /// string nor number fails the decode, and the message takes the full
-    /// path instead.
-    private struct MessageEnvelope: Decodable {
-        let method: String?
-        let id: RequestId?
-    }
-
     private var debugStream: AsyncStream<DebugMessage>?
 
     private let decoder: JSONDecoder
@@ -113,7 +103,7 @@ public actor Client {
         // frames arrive on the reader's queue and `receive` classifies them
         // there, without a hop onto this actor.
         processManager.setHandlers(
-            onMessage: { [weak self] data in self?.receive(data) },
+            onMessage: { [weak self] data, header in self?.receive(data, header: header) },
             onTermination: { [weak self] exitCode in await self?.handleTermination(exitCode: exitCode) }
         )
     }
@@ -1109,8 +1099,11 @@ public actor Client {
     /// message, yielded to a stream a consumer task resumed on, and hopped
     /// onto the router's actor for every notification, a check that
     /// returns for all but two methods. Responses and agent requests still
-    /// hop to the actor, one task each; both are rare by nature.
-    nonisolated private func receive(_ data: Data) {
+    /// hop to the actor, one task each; both are rare by nature. The frame
+    /// arrives with the HEADER its framer read — `method`, and whether an
+    /// `id` holds a value — so a notification is classified without a
+    /// decode of its own.
+    nonisolated private func receive(_ data: Data, header: ACPFrameHeader) {
         // A byte test, not a String decode plus a whitespace trim: both were
         // full passes over the message, paid before the decoder even ran.
         guard data.contains(where: { $0 != 0x20 && $0 != 0x09 && $0 != 0x0D && $0 != 0x0A }) else {
@@ -1118,7 +1111,7 @@ public actor Client {
         }
 
         if let continuation = currentDebugContinuation() {
-            let method = extractMethod(from: data)
+            let method = header.method ?? extractMethod(from: data)
             continuation.yield(DebugMessage(
                 direction: .incoming,
                 timestamp: Date(),
@@ -1128,17 +1121,17 @@ public actor Client {
         }
 
         do {
-            // A NOTIFICATION SKIPS THE TREE: a light envelope classifies the
-            // message, and a notification is built on its own bytes with
-            // `params` decoding on demand — the full `Message` decode built
-            // an `AnyCodable` tree for every notification that a consumer
-            // decoding its typed payload from the same bytes never read
-            // (2026-09-03 profile: the readers ran flat out through a
-            // replay). Requests, responses, and anything the envelope cannot
-            // classify — a malformed id — take the full decode as before,
-            // whose own rule still reads `"id": null` as a notification.
-            if let envelope = try? receiveDecoder.decode(MessageEnvelope.self, from: data),
-               let method = envelope.method, envelope.id == nil {
+            // A NOTIFICATION SKIPS EVERY DECODE HERE: the framer's walk read
+            // the frame's top-level `method` and `id` as it framed it, so a
+            // frame with a method and no id — `null` reading as none, the
+            // rule `Message` applies too — is a notification built on its
+            // own bytes, with `params` decoding on demand. The envelope
+            // decode this replaces parsed the whole frame for those two
+            // keys, and the full `Message` decode before it built an
+            // `AnyCodable` tree besides, for a consumer that parses the
+            // same bytes once for its typed payload. Requests, responses,
+            // array frames, and an unframed tail take the full decode.
+            if let method = header.method, !header.hasId {
                 deliver(JSONRPCNotification(method: method, rawData: data))
                 return
             }

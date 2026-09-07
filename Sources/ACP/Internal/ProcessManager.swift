@@ -32,7 +32,7 @@ actor ACPProcessManager {
     /// client at its own construction, before any launch, so they live
     /// under a lock rather than on the actor.
     private let handlerLock = NSLock()
-    nonisolated(unsafe) private var onMessage: (@Sendable (Data) -> Void)?
+    nonisolated(unsafe) private var onMessage: (@Sendable (Data, ACPFrameHeader) -> Void)?
     nonisolated(unsafe) private var onTermination: (@Sendable (Int32) async -> Void)?
 
     /// Stdin writes run HERE, never on the actor: a write to a full pipe
@@ -192,7 +192,7 @@ actor ACPProcessManager {
             stderr: stderr.fileHandleForReading,
             logger: logger,
             qos: qos,
-            onMessage: { data in onMessage?(data) },
+            onMessage: { data, header in onMessage?(data, header) },
             onStderrLine: { line in lines.yield(line) }
         )
         self.reader = reader
@@ -317,11 +317,11 @@ actor ACPProcessManager {
     // MARK: - Callbacks
 
     /// Installs the receive and termination handlers. `onMessage` is called
-    /// SYNCHRONOUSLY on the reader's queue with each complete frame, in
-    /// order; `onTermination` runs on this actor once every frame the pipes
-    /// still held has been delivered.
+    /// SYNCHRONOUSLY on the reader's queue with each complete frame and the
+    /// header its walk read, in order; `onTermination` runs on this actor
+    /// once every frame the pipes still held has been delivered.
     nonisolated func setHandlers(
-        onMessage: @escaping @Sendable (Data) -> Void,
+        onMessage: @escaping @Sendable (Data, ACPFrameHeader) -> Void,
         onTermination: @escaping @Sendable (Int32) async -> Void
     ) {
         handlerLock.lock()
@@ -373,6 +373,19 @@ actor ACPProcessManager {
     }
 }
 
+/// What the framer read off a frame's top level while walking it: the
+/// `method` string, and whether an `id` key holds a value — `null` reads as
+/// none, JSON-RPC's own rule for a notification. A notification is a frame
+/// with a method and no id. Nil `method` for an array frame, a frame
+/// without one, or an unframed tail at EOF, all of which the client's full
+/// decode judges.
+struct ACPFrameHeader: Sendable {
+    let method: String?
+    let hasId: Bool
+
+    static let unknown = ACPFrameHeader(method: nil, hasId: false)
+}
+
 /// The agent's stdout and stderr, read and FRAMED on ONE serial queue with
 /// no stream, no consumer task, and no actor hop per message (2026-09-04).
 /// A dispatch read source per pipe fires on the queue, the framer walks the
@@ -389,6 +402,13 @@ actor ACPProcessManager {
 /// a grandchild inherited, and the read handles close in the sources'
 /// cancel handlers — the one point past which a source is done with its
 /// descriptor — never from the actor.
+///
+/// EVERY FRAME LEAVES WITH ITS HEADER: the walk that frames it reads the
+/// top-level `method` and whether a top-level `id` holds a value as they
+/// pass, so the client classifies a notification from the header instead
+/// of decoding the frame for two keys — a full parse of a multi-megabyte
+/// update that bought nothing, since the consumer parses the same bytes
+/// once more for its typed payload.
 final class ACPOutputReader: @unchecked Sendable {
     /// Created at the APP'S band (`qos`, from the client's construction —
     /// see `ACPProcessManager.qos`); the read handlers enforce it when one
@@ -400,7 +420,7 @@ final class ACPOutputReader: @unchecked Sendable {
     private let stdout: FileHandle
     private let stderr: FileHandle
     private let logger: Logger
-    private let onMessage: @Sendable (Data) -> Void
+    private let onMessage: @Sendable (Data, ACPFrameHeader) -> Void
     private let onStderrLine: @Sendable (String) -> Void
 
     // Confined to `queue` from here on.
@@ -426,16 +446,34 @@ final class ACPOutputReader: @unchecked Sendable {
     private var scanDepth = 0
     private var scanInString = false
     private var scanEscaped = false
+    /// The header read as the walk passes the frame's top level: where the
+    /// walk stands among a depth-one key, its colon, and its value; the
+    /// key or `method` value being gathered; whether the key just read was
+    /// `method` or `id`; and what the two keys held. Kept across chunks
+    /// like the scan state, and reset at every frame boundary.
+    private var headerPhase = HeaderPhase.none
+    private var headerText: [UInt8] = []
+    private var headerKeyIsMethod = false
+    private var headerKeyIsId = false
+    private var headerMethod: String?
+    private var headerHasId = false
     private var stderrBuffer = Data()
 
-    private static let largeBufferWarningThreshold = 200000
+    /// The walk's place inside the frame's top-level object. `none` is an
+    /// array frame or no frame, where nothing is gathered.
+    private enum HeaderPhase: UInt8 {
+        case none, key, keyString, afterKey, value, valueString, afterValue
+    }
+
+    private static let methodKey: [UInt8] = Array("method".utf8)
+    private static let idKey: [UInt8] = Array("id".utf8)
 
     init(
         stdout: FileHandle,
         stderr: FileHandle,
         logger: Logger,
         qos: DispatchQoS,
-        onMessage: @escaping @Sendable (Data) -> Void,
+        onMessage: @escaping @Sendable (Data, ACPFrameHeader) -> Void,
         onStderrLine: @escaping @Sendable (String) -> Void
     ) {
         self.stdout = stdout
@@ -546,8 +584,8 @@ final class ACPOutputReader: @unchecked Sendable {
 
     private func receiveStdout(_ data: Data) {
         readBuffer.append(data)
-        while let message = popNextMessage() {
-            onMessage(message)
+        while let (message, header) = popNextMessage() {
+            onMessage(message, header)
         }
     }
 
@@ -573,7 +611,9 @@ final class ACPOutputReader: @unchecked Sendable {
             : Data()
         resetReadState()
         if !remaining.isEmpty {
-            onMessage(remaining)
+            // An unframed tail: its header was never completed, so it
+            // goes out unknown and the client's full decode judges it.
+            onMessage(remaining, .unknown)
         }
         if !stderrBuffer.isEmpty {
             onStderrLine(String(decoding: stderrBuffer, as: UTF8.self))
@@ -593,8 +633,10 @@ final class ACPOutputReader: @unchecked Sendable {
     /// validate it, and `removeFirst`-shifted the remainder — four full
     /// passes per message, quadratic for a chunked frame, and a session's
     /// reader task ran flat out for the length of a stream. Validation is
-    /// the decoder's job: a malformed frame fails there and is logged.
-    private func popNextMessage() -> Data? {
+    /// the decoder's job: a malformed frame fails there and is logged. The
+    /// frame's HEADER comes out with it, read by the same walk at its top
+    /// level — see `ACPFrameHeader`.
+    private func popNextMessage() -> (Data, ACPFrameHeader)? {
         while true {
             let count = readBuffer.count
             if scanDepth == 0 {
@@ -629,6 +671,7 @@ final class ACPOutputReader: @unchecked Sendable {
                 }
                 readOffset = start
                 scanIndex = start
+                resetHeaderState()
             }
 
             // Inside a message, or at its first byte: walk on from the
@@ -643,6 +686,16 @@ final class ACPOutputReader: @unchecked Sendable {
             var depth = scanDepth
             var inString = scanInString
             var escaped = scanEscaped
+            var phase = headerPhase
+            var text = headerText
+            var keyIsMethod = headerKeyIsMethod
+            var keyIsId = headerKeyIsId
+            var method = headerMethod
+            var hasId = headerHasId
+            // Gathering a depth-one key, or the value under `method`; every
+            // other string is walked and nothing else. Hoisted so a byte
+            // inside a string costs one test.
+            var capturing = phase == .keyString || (phase == .valueString && keyIsMethod)
             readBuffer.withUnsafeBytes { raw in
                 let bytes = raw.bindMemory(to: UInt8.self)
                 while index < count {
@@ -661,14 +714,56 @@ final class ACPOutputReader: @unchecked Sendable {
                     } else if inString {
                         if escaped {
                             escaped = false
+                            if capturing { text.append(byte) }
                         } else if byte == 0x5C {
                             escaped = true
+                            if capturing { text.append(byte) }
                         } else if byte == 0x22 {
                             inString = false
+                            if phase == .keyString {
+                                keyIsMethod = text == Self.methodKey
+                                keyIsId = text == Self.idKey
+                                phase = .afterKey
+                            } else if phase == .valueString {
+                                // A method with an escape in it (an encoder
+                                // that writes `\/`) is left to the full
+                                // decode, which unescapes; the raw bytes
+                                // would name a method nothing matches.
+                                if keyIsMethod, !text.contains(0x5C) {
+                                    method = String(decoding: text, as: UTF8.self)
+                                }
+                                phase = .afterValue
+                            }
+                            capturing = false
+                        } else if capturing {
+                            text.append(byte)
                         }
                     } else if byte == 0x22 {
                         inString = true
+                        if depth == 1 {
+                            if phase == .key {
+                                text.removeAll(keepingCapacity: true)
+                                phase = .keyString
+                                capturing = true
+                            } else if phase == .value {
+                                text.removeAll(keepingCapacity: true)
+                                if keyIsId { hasId = true }
+                                phase = .valueString
+                                capturing = keyIsMethod
+                            }
+                        }
                     } else if byte == 0x7B || byte == 0x5B {
+                        if depth == 0 {
+                            // The frame opens: an object's top level is
+                            // read, an array's is not.
+                            phase = byte == 0x7B ? .key : .none
+                        } else if depth == 1, phase == .value {
+                            // A nested value under a top-level key: `id`
+                            // holds something, and the walk resumes at the
+                            // top level once the depth returns.
+                            if keyIsId { hasId = true }
+                            phase = .afterValue
+                        }
                         depth += 1
                     } else if byte == 0x7D || byte == 0x5D {
                         depth -= 1
@@ -676,6 +771,17 @@ final class ACPOutputReader: @unchecked Sendable {
                             end = index
                             index += 1
                             break
+                        }
+                    } else if depth == 1 {
+                        if byte == 0x3A {
+                            if phase == .afterKey { phase = .value }
+                        } else if byte == 0x2C {
+                            phase = .key
+                        } else if phase == .value, byte != 0x20, byte != 0x09, byte != 0x0D {
+                            // A number or a literal: `id` holds a value
+                            // unless the literal is null.
+                            if keyIsId { hasId = byte != 0x6E }
+                            phase = .afterValue
                         }
                     }
                     index += 1
@@ -685,6 +791,12 @@ final class ACPOutputReader: @unchecked Sendable {
             scanDepth = depth
             scanInString = inString
             scanEscaped = escaped
+            headerPhase = phase
+            headerText = text
+            headerKeyIsMethod = keyIsMethod
+            headerKeyIsId = keyIsId
+            headerMethod = method
+            headerHasId = hasId
 
             if let malformedLineEnd {
                 logger.warning("Discarded malformed JSON stdout line (\(malformedLineEnd - self.readOffset) bytes)")
@@ -693,25 +805,35 @@ final class ACPOutputReader: @unchecked Sendable {
                 scanDepth = 0
                 scanInString = false
                 scanEscaped = false
+                resetHeaderState()
                 compactReadBuffer()
                 continue
             }
 
-            guard let end else {
-                if count - readOffset > Self.largeBufferWarningThreshold {
-                    logger.warning("Large buffer (\(count - self.readOffset) bytes) without complete JSON message")
-                }
-                return nil
-            }
+            // A frame still arriving is normal traffic: the scan resumes
+            // where it stopped, so a large pending frame costs its append
+            // and nothing else.
+            guard let end else { return nil }
             let message = readBuffer.subdata(in: readOffset..<(end + 1))
+            let header = ACPFrameHeader(method: headerMethod, hasId: headerHasId)
             readOffset = end + 1
             scanIndex = readOffset
             scanDepth = 0
             scanInString = false
             scanEscaped = false
+            resetHeaderState()
             compactReadBuffer()
-            return message
+            return (message, header)
         }
+    }
+
+    private func resetHeaderState() {
+        headerPhase = .none
+        headerText.removeAll(keepingCapacity: true)
+        headerKeyIsMethod = false
+        headerKeyIsId = false
+        headerMethod = nil
+        headerHasId = false
     }
 
     private static func isWhitespace(_ byte: UInt8) -> Bool {
@@ -741,6 +863,7 @@ final class ACPOutputReader: @unchecked Sendable {
         scanDepth = 0
         scanInString = false
         scanEscaped = false
+        resetHeaderState()
     }
 }
 #endif
