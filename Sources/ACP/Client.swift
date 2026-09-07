@@ -78,6 +78,21 @@ public actor Client {
     private let decoder: ACPJSONDecoder
     private let encoder: ACPJSONEncoder
 
+    /// ONE SERIAL QUEUE PER CONNECTION, and every actor of the connection
+    /// runs on it: this one, the process manager, the router, and the
+    /// error handler all name it as their executor, so their jobs run on
+    /// GCD threads — which the system adds as a job blocks or grinds —
+    /// instead of the process-wide cooperative pool, a fixed handful of
+    /// threads that a few connections' worth of non-suspending work
+    /// (a terminal buffering a chatty command) starved for every other
+    /// connection at once: an agent waiting on a reply sends nothing, and
+    /// its turn froze until the others finished. At the intake's QoS.
+    private let executionQueue: DispatchSerialQueue
+
+    public nonisolated var unownedExecutor: UnownedSerialExecutor {
+        executionQueue.asUnownedSerialExecutor()
+    }
+
     public weak var delegate: ClientDelegate?
 
     // MARK: - Initialization
@@ -90,6 +105,7 @@ public actor Client {
     public init(qos: DispatchQoS = .unspecified) {
         decoder = ACPJSONDecoder()
         encoder = ACPJSONEncoder()
+        executionQueue = DispatchSerialQueue(label: "org.acp.client", qos: qos)
 
         var continuation: AsyncStream<JSONRPCNotification>.Continuation!
         notificationStream = AsyncStream { cont in
@@ -97,9 +113,9 @@ public actor Client {
         }
         notificationContinuation = continuation
 
-        processManager = ACPProcessManager(qos: qos)
-        requestRouter = ACPRequestRouter()
-        errorHandler = ErrorHandler()
+        processManager = ACPProcessManager(qos: qos, executor: executionQueue)
+        requestRouter = ACPRequestRouter(executor: executionQueue)
+        errorHandler = ErrorHandler(executor: executionQueue)
 
         // Installed synchronously, before any launch can race them: the
         // frames arrive on the reader's queue and `receive` classifies them

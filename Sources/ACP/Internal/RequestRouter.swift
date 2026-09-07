@@ -18,11 +18,20 @@ actor ACPRequestRouter {
     private let encoder = ACPJSONEncoder()
     private let decoder = ACPJSONDecoder()
 
+    /// The connection's queue, this actor's executor — see `Client`.
+    private let executionQueue: DispatchSerialQueue
+
+    nonisolated var unownedExecutor: UnownedSerialExecutor {
+        executionQueue.asUnownedSerialExecutor()
+    }
+
     weak var delegate: ClientDelegate?
 
     // MARK: - Initialization
 
-    init() {}
+    init(executor: DispatchSerialQueue = DispatchSerialQueue(label: "org.acp.router")) {
+        self.executionQueue = executor
+    }
 
     // MARK: - Delegate Management
 

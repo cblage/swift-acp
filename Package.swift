@@ -3,11 +3,14 @@ import PackageDescription
 
 let package = Package(
     name: "swift-acp",
+    // The floor a queue-backed actor executor needs (DispatchSerialQueue as
+    // a SerialExecutor): every actor in the package runs its jobs on a
+    // serial dispatch queue of its own instead of the cooperative pool.
     platforms: [
-        .macOS(.v12),
-        .iOS(.v15),
-        .tvOS(.v15),
-        .watchOS(.v8)
+        .macOS(.v14),
+        .iOS(.v17),
+        .tvOS(.v17),
+        .watchOS(.v10)
     ],
     products: [
         .library(name: "ACPModel", targets: ["ACPModel"]),

@@ -19,9 +19,18 @@ actor ErrorHandler {
     /// types that are not `Sendable`.
     private let encoder = ACPJSONEncoder()
 
+    /// The connection's queue, this actor's executor — see `Client`.
+    private let executionQueue: DispatchSerialQueue
+
+    nonisolated var unownedExecutor: UnownedSerialExecutor {
+        executionQueue.asUnownedSerialExecutor()
+    }
+
     // MARK: - Initialization
 
-    init() {}
+    init(executor: DispatchSerialQueue = DispatchSerialQueue(label: "org.acp.errors")) {
+        self.executionQueue = executor
+    }
 
     // MARK: - Error Response Creation
 

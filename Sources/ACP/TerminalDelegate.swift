@@ -6,18 +6,26 @@
 //
 
 #if os(macOS)
+import Darwin
 import Foundation
 import ACPModel
 
 /// Tracks state of a single terminal
 private struct TerminalState: @unchecked Sendable {
     let process: Process
-    var outputBuffer: String = ""
+    /// BYTES, not a `String`: a chunk of output costs its own append. The
+    /// string buffer this replaces counted its characters on every chunk,
+    /// a walk of up to a megabyte per 64 KiB that pinned a thread for the
+    /// length of a chatty command.
+    var outputBuffer = Data()
     var outputByteLimit: Int?
     var lastReadIndex: Int = 0
     var isReleased: Bool = false
     var wasTruncated: Bool = false
     var exitWaiters: [CheckedContinuation<(exitCode: Int?, signal: String?), Never>] = []
+    /// The read sources on the process's stdout and stderr, cancelled at
+    /// release; their cancel handlers close the handles.
+    var sources: [DispatchSourceRead] = []
 }
 
 /// Cached output for released terminals
@@ -59,48 +67,38 @@ public actor TerminalDelegate {
     private let defaultOutputByteLimit = 1_000_000
     private let maxReleasedOutputEntries = 50
 
-    // MARK: - Private Cleanup
+    /// THIS ACTOR'S OWN SERIAL QUEUE, its executor: its jobs — every
+    /// request the agent makes of its terminals, and every chunk of output
+    /// they produce — run on a GCD thread of this queue's, never on the
+    /// process-wide cooperative pool, whose fixed handful of threads a few
+    /// chatty commands across connections pinned for every other
+    /// connection at once. The read sources below fire on the same queue,
+    /// so a chunk lands in the buffer without a task hop.
+    private let executionQueue: DispatchSerialQueue
 
-    private func drainPipe(_ pipe: Pipe, terminalId: String) {
-        let handle = pipe.fileHandleForReading
-        handle.readabilityHandler = nil
-
-        do {
-            while true {
-                guard let data = try handle.read(upToCount: 65536), !data.isEmpty else {
-                    break
-                }
-                if let output = String(data: data, encoding: .utf8) {
-                    appendOutput(terminalId: terminalId, output: output)
-                }
-            }
-        } catch {
-            // File handle already closed
-        }
+    public nonisolated var unownedExecutor: UnownedSerialExecutor {
+        executionQueue.asUnownedSerialExecutor()
     }
 
-    private func cleanupProcessPipes(_ process: Process, terminalId: String? = nil) {
-        if let outputPipe = process.standardOutput as? Pipe {
-            if let id = terminalId {
-                drainPipe(outputPipe, terminalId: id)
-            } else {
-                outputPipe.fileHandleForReading.readabilityHandler = nil
-            }
-            try? outputPipe.fileHandleForReading.close()
-        }
-        if let errorPipe = process.standardError as? Pipe {
-            if let id = terminalId {
-                drainPipe(errorPipe, terminalId: id)
-            } else {
-                errorPipe.fileHandleForReading.readabilityHandler = nil
-            }
-            try? errorPipe.fileHandleForReading.close()
-        }
+    // MARK: - Private Cleanup
+
+    /// What the pipes still hold, then the sources cancelled — whose cancel
+    /// handlers close the handles — so nothing reads a closed descriptor.
+    private func cleanupProcessPipes(terminalId: String) {
+        drainAvailableOutput(terminalId: terminalId)
+        guard var state = terminals[terminalId] else { return }
+        for source in state.sources { source.cancel() }
+        state.sources.removeAll()
+        terminals[terminalId] = state
     }
 
     // MARK: - Initialization
 
-    public init() {}
+    /// `qos` is the queue's band — the connection's intake QoS is the
+    /// natural choice, since the agent waits on these replies.
+    public init(qos: DispatchQoS = .unspecified) {
+        executionQueue = DispatchSerialQueue(label: "org.acp.terminal", qos: qos)
+    }
 
     // MARK: - Terminal Operations
 
@@ -164,55 +162,55 @@ public actor TerminalDelegate {
         let terminalIdValue = UUID().uuidString
         let terminalId = TerminalId(terminalIdValue)
 
-        let state = TerminalState(process: process, outputByteLimit: outputByteLimit ?? defaultOutputByteLimit)
+        var state = TerminalState(process: process, outputByteLimit: outputByteLimit ?? defaultOutputByteLimit)
+        state.sources = [
+            makeReadSource(outputPipe.fileHandleForReading, terminalId: terminalIdValue),
+            makeReadSource(errorPipe.fileHandleForReading, terminalId: terminalIdValue),
+        ]
         terminals[terminalIdValue] = state
-
-        outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            do {
-                guard let data = try handle.read(upToCount: 65536) else {
-                    handle.readabilityHandler = nil
-                    try? handle.close()
-                    return
-                }
-                if data.isEmpty {
-                    handle.readabilityHandler = nil
-                    try? handle.close()
-                    return
-                }
-                if let output = String(data: data, encoding: .utf8) {
-                    Task {
-                        await self?.appendOutput(terminalId: terminalIdValue, output: output)
-                    }
-                }
-            } catch {
-                handle.readabilityHandler = nil
-            }
-        }
-
-        errorPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            do {
-                guard let data = try handle.read(upToCount: 65536) else {
-                    handle.readabilityHandler = nil
-                    try? handle.close()
-                    return
-                }
-                if data.isEmpty {
-                    handle.readabilityHandler = nil
-                    try? handle.close()
-                    return
-                }
-                if let output = String(data: data, encoding: .utf8) {
-                    Task {
-                        await self?.appendOutput(terminalId: terminalIdValue, output: output)
-                    }
-                }
-            } catch {
-                handle.readabilityHandler = nil
-            }
-        }
 
         try process.run()
         return CreateTerminalResponse(terminalId: terminalId, _meta: nil)
+    }
+
+    /// A pipe read on THIS ACTOR'S QUEUE as it becomes readable, the shape
+    /// the process reader has: a non-blocking descriptor, a drain to empty
+    /// per event, the bytes appended in place. The source is made on the
+    /// executor's queue, so its handler is on the actor by construction and
+    /// says so; the readability handler and the task per chunk it replaces
+    /// crossed a global queue and the cooperative pool for every 64 KiB.
+    private func makeReadSource(_ handle: FileHandle, terminalId: String) -> DispatchSourceRead {
+        let fd = handle.fileDescriptor
+        _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: executionQueue)
+        source.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.assumeIsolated { delegate in
+                if delegate.drain(fd: fd, into: terminalId) { source.cancel() }
+            }
+        }
+        source.setCancelHandler { try? handle.close() }
+        source.resume()
+        return source
+    }
+
+    /// Reads until the pipe holds nothing more right now, or is at EOF —
+    /// true at EOF. Non-blocking by the flag set at the source's creation.
+    private func drain(fd: Int32, into terminalId: String) -> Bool {
+        var chunk = [UInt8](repeating: 0, count: 65536)
+        while true {
+            let count = chunk.withUnsafeMutableBytes { raw -> Int in
+                guard let base = raw.baseAddress else { return 0 }
+                return Darwin.read(fd, base, raw.count)
+            }
+            if count > 0 {
+                appendOutput(terminalId: terminalId, bytes: chunk[0..<count])
+                continue
+            }
+            if count == 0 { return true }
+            if errno == EINTR { continue }
+            return false
+        }
     }
 
     /// Get output from a terminal process
@@ -225,7 +223,7 @@ public actor TerminalDelegate {
             throw TerminalError.terminalReleased(terminalId.value)
         }
 
-        drainAvailableOutput(terminalId: terminalId.value, process: state.process)
+        drainAvailableOutput(terminalId: terminalId.value)
         state = terminals[terminalId.value] ?? state
 
         let exitStatus: TerminalExitStatus?
@@ -239,10 +237,11 @@ public actor TerminalDelegate {
             )
         }
 
+        let output = outputText(of: state)
         return TerminalOutputResponse(
-            output: state.outputBuffer,
+            output: output.text,
             exitStatus: exitStatus,
-            truncated: state.wasTruncated,
+            truncated: output.truncated,
             _meta: nil
         )
     }
@@ -318,7 +317,7 @@ public actor TerminalDelegate {
             state.process.waitUntilExit()
         }
 
-        cleanupProcessPipes(state.process, terminalId: terminalId.value)
+        cleanupProcessPipes(terminalId: terminalId.value)
         state = terminals[terminalId.value] ?? state
 
         let exitCode = Int(state.process.terminationStatus)
@@ -328,7 +327,7 @@ public actor TerminalDelegate {
 
         cacheReleasedOutput(
             terminalId: terminalId.value,
-            output: state.outputBuffer,
+            output: outputText(of: state).text,
             exitCode: exitCode
         )
 
@@ -341,12 +340,12 @@ public actor TerminalDelegate {
 
     /// Clean up all terminals
     public func cleanup() async {
-        for (_, state) in terminals {
+        for (terminalId, state) in terminals {
             if state.process.isRunning {
                 state.process.terminate()
                 state.process.waitUntilExit()
             }
-            cleanupProcessPipes(state.process)
+            cleanupProcessPipes(terminalId: terminalId)
             let exitCode = Int(state.process.terminationStatus)
             for waiter in state.exitWaiters {
                 waiter.resume(returning: (exitCode, nil))
@@ -362,8 +361,8 @@ public actor TerminalDelegate {
     /// Get terminal output for display
     public func getOutput(terminalId: TerminalId) -> String? {
         if let state = terminals[terminalId.value] {
-            drainAvailableOutput(terminalId: terminalId.value, process: state.process)
-            return terminals[terminalId.value]?.outputBuffer ?? state.outputBuffer
+            drainAvailableOutput(terminalId: terminalId.value)
+            return outputText(of: terminals[terminalId.value] ?? state).text
         }
         return releasedOutputs[terminalId.value]?.output
     }
@@ -373,50 +372,56 @@ public actor TerminalDelegate {
         return terminals[terminalId.value]?.process.isRunning ?? false
     }
 
-    private func drainAvailableOutput(terminalId: String, process: Process) {
-        guard process.isRunning else { return }
-
-        if let outputPipe = process.standardOutput as? Pipe {
-            let handle = outputPipe.fileHandleForReading
-            do {
-                if let data = try handle.read(upToCount: 65536), !data.isEmpty,
-                   let output = String(data: data, encoding: .utf8) {
-                    appendOutput(terminalId: terminalId, output: output)
-                }
-            } catch {
-                // File handle closed
-            }
-        }
-        if let errorPipe = process.standardError as? Pipe {
-            let handle = errorPipe.fileHandleForReading
-            do {
-                if let data = try handle.read(upToCount: 65536), !data.isEmpty,
-                   let output = String(data: data, encoding: .utf8) {
-                    appendOutput(terminalId: terminalId, output: output)
-                }
-            } catch {
-                // File handle closed
-            }
+    /// What the pipes hold right now, read on the spot — a reply carries
+    /// the output up to the moment it was asked for, not up to the last
+    /// readable event. The descriptors are non-blocking; a closed one
+    /// answers with an error the drain returns on.
+    private func drainAvailableOutput(terminalId: String) {
+        guard let state = terminals[terminalId] else { return }
+        for pipe in [state.process.standardOutput, state.process.standardError] {
+            guard let pipe = pipe as? Pipe else { continue }
+            _ = drain(fd: pipe.fileHandleForReading.fileDescriptor, into: terminalId)
         }
     }
 
     // MARK: - Private Helpers
 
-    private func appendOutput(terminalId: String, output: String) {
+    /// Appends a chunk for its own cost. THE LIMIT IS ENFORCED AMORTISED:
+    /// the buffer runs to twice the limit before one trim back to it, at a
+    /// UTF-8 boundary, so a chunk never pays a walk of the whole buffer;
+    /// what a reply shows is cut to the limit at read time.
+    private func appendOutput(terminalId: String, bytes: ArraySlice<UInt8>) {
         guard var state = terminals[terminalId] else { return }
 
-        state.outputBuffer += output
+        state.outputBuffer.append(contentsOf: bytes)
 
-        if let limit = state.outputByteLimit, state.outputBuffer.count > limit {
-            let startIndex = state.outputBuffer.index(
-                state.outputBuffer.startIndex,
-                offsetBy: state.outputBuffer.count - limit
-            )
-            state.outputBuffer = String(state.outputBuffer[startIndex...])
+        if let limit = state.outputByteLimit, state.outputBuffer.count > limit * 2 {
+            let cut = Self.utf8Boundary(in: state.outputBuffer, at: state.outputBuffer.count - limit)
+            state.outputBuffer.removeFirst(cut)
             state.wasTruncated = true
         }
 
         terminals[terminalId] = state
+    }
+
+    /// The buffer's last `limit` bytes as text, at a UTF-8 boundary, and
+    /// whether anything was ever cut.
+    private func outputText(of state: TerminalState) -> (text: String, truncated: Bool) {
+        var bytes = state.outputBuffer
+        var truncated = state.wasTruncated
+        if let limit = state.outputByteLimit, bytes.count > limit {
+            let cut = Self.utf8Boundary(in: bytes, at: bytes.count - limit)
+            bytes = bytes.suffix(from: bytes.startIndex + cut)
+            truncated = true
+        }
+        return (String(decoding: bytes, as: UTF8.self), truncated)
+    }
+
+    /// The first offset at or past `offset` that starts a UTF-8 scalar.
+    private static func utf8Boundary(in data: Data, at offset: Int) -> Int {
+        var cut = offset
+        while cut < data.count, data[data.startIndex + cut] & 0xC0 == 0x80 { cut += 1 }
+        return cut
     }
 
     private func cacheReleasedOutput(terminalId: String, output: String, exitCode: Int) {

@@ -50,6 +50,13 @@ actor ACPProcessManager {
     private let enforced: DispatchWorkItemFlags
     private let writeQueue: DispatchQueue
 
+    /// The connection's queue, this actor's executor — see `Client`.
+    private let executionQueue: DispatchSerialQueue
+
+    nonisolated var unownedExecutor: UnownedSerialExecutor {
+        executionQueue.asUnownedSerialExecutor()
+    }
+
     private var stderrLineContinuation: AsyncStream<String>.Continuation?
     private var stderrLineStream: AsyncStream<String>?
 
@@ -58,7 +65,11 @@ actor ACPProcessManager {
     /// No coder of its own: the frames it reads leave as bytes with their
     /// header, and the messages it writes arrive as bytes the client
     /// encoded.
-    init(qos: DispatchQoS) {
+    init(
+        qos: DispatchQoS,
+        executor: DispatchSerialQueue = DispatchSerialQueue(label: "org.acp.process")
+    ) {
+        self.executionQueue = executor
         self.logger = Logger.forCategory("ACPProcessManager")
         self.qos = qos
         self.enforced = qos == .unspecified ? [] : [.enforceQoS]
