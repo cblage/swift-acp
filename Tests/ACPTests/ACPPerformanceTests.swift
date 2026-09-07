@@ -154,9 +154,8 @@ final class ACPPerformanceTests: XCTestCase {
         """)
 
         weak var weakClient: Client?
-        var receivedNotification = false
 
-        try await {
+        let receivedNotification = try await {
             let client = Client()
             weakClient = client
 
@@ -164,14 +163,15 @@ final class ACPPerformanceTests: XCTestCase {
 
             let notifications = await client.notifications
 
-            // Start listening task
+            // The listener reports through its value, not a captured
+            // variable: a task's closure is `sending`, and a variable
+            // written inside it and read outside it is the race Swift 6
+            // refuses. Cancelled before its notification, it reads false.
             let listenTask = Task {
-                for await notification in notifications {
-                    if notification.method == "session/update" {
-                        receivedNotification = true
-                        break
-                    }
+                for await notification in notifications where notification.method == "session/update" {
+                    return true
                 }
+                return false
             }
 
             _ = try await client.initialize(capabilities: makeCapabilities(), timeout: 5.0)
@@ -180,7 +180,9 @@ final class ACPPerformanceTests: XCTestCase {
             try await Task.sleep(nanoseconds: 200_000_000)
 
             listenTask.cancel()
+            let received = await listenTask.value
             await client.terminate()
+            return received
         }()
 
         try await Task.sleep(nanoseconds: 100_000_000)

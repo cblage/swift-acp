@@ -7,6 +7,7 @@
 
 import Foundation
 import ACPModel
+import YYJSON
 
 // ClientError is now defined in ACPModel
 // This file contains the ErrorHandler actor which is ACP-specific
@@ -14,13 +15,13 @@ import ACPModel
 actor ErrorHandler {
     // MARK: - Properties
 
-    private let encoder: JSONEncoder
+    /// Its own encoder, like every actor here: the yyjson coders are value
+    /// types that are not `Sendable`.
+    private let encoder = YYJSONEncoder()
 
     // MARK: - Initialization
 
-    init(encoder: JSONEncoder) {
-        self.encoder = encoder
-    }
+    init() {}
 
     // MARK: - Error Response Creation
 

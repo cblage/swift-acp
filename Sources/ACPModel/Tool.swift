@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import YYJSON
 
 // MARK: - Tool Call Content
 
@@ -91,8 +92,8 @@ public enum ToolCallContent: Codable, Sendable {
     }
 
     public func toDictionary() -> [String: any Sendable] {
-        guard let data = try? JSONEncoder().encode(self),
-              let object = try? JSONSerialization.jsonObject(with: data),
+        guard let data = try? YYJSONEncoder().encode(self),
+              let object = try? YYJSONSerialization.jsonObject(with: data),
               let dict = object as? [String: any Sendable] else {
             return [:]
         }

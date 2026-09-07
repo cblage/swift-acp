@@ -24,8 +24,6 @@ actor ACPProcessManager {
     /// reader's own serial queue — see `ACPOutputReader`.
     private var reader: ACPOutputReader?
 
-    private let encoder: JSONEncoder
-    private let decoder: JSONDecoder
     private let logger: Logger
 
     /// The handlers cross to the reader's queue and are installed by the
@@ -57,9 +55,10 @@ actor ACPProcessManager {
 
     // MARK: - Initialization
 
-    init(encoder: JSONEncoder, decoder: JSONDecoder, qos: DispatchQoS) {
-        self.encoder = encoder
-        self.decoder = decoder
+    /// No coder of its own: the frames it reads leave as bytes with their
+    /// header, and the messages it writes arrive as bytes the client
+    /// encoded.
+    init(qos: DispatchQoS) {
         self.logger = Logger.forCategory("ACPProcessManager")
         self.qos = qos
         self.enforced = qos == .unspecified ? [] : [.enforceQoS]
@@ -269,16 +268,16 @@ actor ACPProcessManager {
 
     // MARK: - I/O Operations
 
-    func writeMessage<T: Encodable>(_ message: T) async throws {
+    /// Writes one encoded message as a line. The BYTES cross to this
+    /// actor, encoded by the caller on its own: a generic `Encodable`
+    /// value is not `Sendable`, and the client encodes once anyway.
+    func writeMessage(_ data: Data) async throws {
         let fd = stdinDescriptor
         guard fd >= 0, let proc = process, proc.isRunning else {
             throw ClientError.processNotRunning
         }
 
-        let data = try encoder.encode(message)
-
-        var lineData = data
-        lineData.append(0x0A)
+        let lineData = data + Data([0x0A])
 
         // Only the descriptor crosses to the queue: the write loop is POSIX
         // so the closure captures nothing but Sendable values, and a
@@ -358,9 +357,9 @@ actor ACPProcessManager {
 
         logger.info("Agent process terminated with code: \(exitCode)")
         await ProcessRegistry.shared.removeProcess(pid: pid, pgid: pgid)
-        handlerLock.lock()
-        let onTermination = self.onTermination
-        handlerLock.unlock()
+        // The scoped form: a bare lock/unlock pair is not allowed across
+        // an async context, and nothing here awaits inside it.
+        let onTermination = handlerLock.withLock { self.onTermination }
         await onTermination?(exitCode)
     }
 

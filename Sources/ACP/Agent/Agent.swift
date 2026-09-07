@@ -8,6 +8,7 @@
 import Foundation
 import os.log
 import ACPModel
+import YYJSON
 
 /// Protocol for handling agent operations
 public protocol AgentDelegate: AnyObject, Sendable {
@@ -211,8 +212,8 @@ public actor Agent {
 
     private let transport: any Transport
     private let logger: Logger
-    private let encoder: JSONEncoder
-    private let decoder: JSONDecoder
+    private let encoder: YYJSONEncoder
+    private let decoder: YYJSONDecoder
 
     private weak var delegate: AgentDelegate?
     private var pendingRequests: [RequestId: CheckedContinuation<JSONRPCResponse, Error>] = [:]
@@ -233,9 +234,8 @@ public actor Agent {
     public init(transport: any Transport) {
         self.transport = transport
         self.logger = Logger.forCategory("Agent")
-        self.encoder = JSONEncoder()
-        self.encoder.outputFormatting = [.withoutEscapingSlashes]
-        self.decoder = JSONDecoder()
+        self.encoder = YYJSONEncoder()
+        self.decoder = YYJSONDecoder()
 
         var continuation: AsyncStream<AgentRequest>.Continuation!
         self.requestStream = AsyncStream { cont in

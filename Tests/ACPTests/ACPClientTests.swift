@@ -4,7 +4,7 @@ import XCTest
 final class ACPClientTests: XCTestCase {
 
     func testUserQuestionEnvelopeUsesDedicatedDelegate() async throws {
-        let router = ACPRequestRouter(encoder: JSONEncoder(), decoder: JSONDecoder())
+        let router = ACPRequestRouter()
         let delegate = UserQuestionRecordingDelegate()
         await router.setDelegate(delegate)
         let rawInput = AnyCodable([
@@ -13,8 +13,8 @@ final class ACPClientTests: XCTestCase {
                 "question": "Pick one",
                 "options": [["label": "First", "description": "The first option"]],
                 "multiSelect": false,
-            ]],
-        ])
+            ] as [String: any Sendable]],
+        ] as [String: any Sendable])
         let params = RequestPermissionRequest(
             options: [PermissionOption(kind: "allow_once", name: "Submit", optionId: "proceed_once")],
             sessionId: SessionId("session-1"),
@@ -823,7 +823,7 @@ final class ACPClientTests: XCTestCase {
         let encoder = JSONEncoder()
         let decoder = JSONDecoder()
 
-        let dictValue = AnyCodable(["key": "value", "number": 123] as [String: Any])
+        let dictValue = AnyCodable(["key": "value", "number": 123] as [String: any Sendable])
         let data = try encoder.encode(dictValue)
         let decoded = try decoder.decode(AnyCodable.self, from: data)
 

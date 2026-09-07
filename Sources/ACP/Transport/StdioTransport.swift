@@ -9,6 +9,7 @@
 import Foundation
 import os.log
 import ACPModel
+import YYJSON
 
 /// Transport implementation using STDIO pipes for subprocess communication.
 /// This transport launches and manages a subprocess, communicating via stdin/stdout.
@@ -30,7 +31,7 @@ public actor StdioTransport: Transport {
     private var stdoutContinuation: AsyncStream<Data>.Continuation?
     private var stdoutConsumerTask: Task<Void, Never>?
 
-    private let encoder: JSONEncoder
+    private let encoder: YYJSONEncoder
 
     // MARK: - Transport Protocol
 
@@ -47,8 +48,7 @@ public actor StdioTransport: Transport {
     public init(configuration: TransportConfiguration = .default) {
         self.configuration = configuration
         self.logger = Logger.forCategory("StdioTransport")
-        self.encoder = JSONEncoder()
-        self.encoder.outputFormatting = [.withoutEscapingSlashes]
+        self.encoder = YYJSONEncoder()
 
         var continuation: AsyncStream<Data>.Continuation!
         self.messageStream = AsyncStream { cont in

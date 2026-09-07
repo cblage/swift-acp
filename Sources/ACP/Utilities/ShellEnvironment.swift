@@ -12,8 +12,11 @@ import os.log
 public enum ShellEnvironment: Sendable {
     private static let cacheLock = NSLock()
     private static let cacheCondition = NSCondition()
-    private static var cachedEnvironment: [String: String]?
-    private static var isLoading = false
+    /// Both read and written under `cacheLock` only — the waiting reader
+    /// below takes it through `cachedEnvironmentSnapshot` between its
+    /// condition waits — which is what makes the unchecked globals sound.
+    nonisolated(unsafe) private static var cachedEnvironment: [String: String]?
+    nonisolated(unsafe) private static var isLoading = false
 
     /// Get user's shell environment (cached after first load)
     /// Warning: On main thread, returns immediately with potentially incomplete environment.
@@ -78,10 +81,12 @@ public enum ShellEnvironment: Sendable {
             cacheLock.unlock()
 
             cacheCondition.lock()
-            while cachedEnvironment == nil {
+            var loaded = cachedEnvironmentSnapshot()
+            while loaded == nil {
                 cacheCondition.wait()
+                loaded = cachedEnvironmentSnapshot()
             }
-            let env = cachedEnvironment!
+            let env = loaded!
             cacheCondition.unlock()
             return env
         }

@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import YYJSON
 
 public enum ClientError: Error, LocalizedError, Sendable {
     case processNotRunning
@@ -43,7 +44,7 @@ public enum ClientError: Error, LocalizedError, Sendable {
             if let data = jsonError.data?.value as? [String: Any],
                let details = data["details"] as? String {
                 if let detailsData = details.data(using: .utf8),
-                   let json = try? JSONSerialization.jsonObject(with: detailsData) as? [String: Any],
+                   let json = try? YYJSONSerialization.jsonObject(with: detailsData) as? [String: Any],
                    let error = json["error"] as? [String: Any],
                    let message = error["message"] as? String {
                     return message

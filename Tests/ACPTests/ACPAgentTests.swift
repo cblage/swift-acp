@@ -59,7 +59,7 @@ final class ACPAgentTests: XCTestCase {
                 "sessionId": "session-123",
                 "cwd": "/tmp/project",
                 "additionalDirectories": ["/tmp/shared"],
-            ])
+            ] as [String: any Sendable])
         )
         let requestData = try JSONEncoder().encode(request)
         await transport.pushMessage(requestData)
@@ -215,7 +215,7 @@ final class ACPAgentTests: XCTestCase {
                 "sessionId": "session-123",
                 "cwd": "/tmp/fork",
                 "additionalDirectories": ["/tmp/shared"],
-            ])
+            ] as [String: any Sendable])
         )
         await transport.pushMessage(try JSONEncoder().encode(forkRequest))
 
@@ -251,7 +251,7 @@ final class ACPAgentTests: XCTestCase {
                 "version": 1,
                 "position": ["line": 0, "character": 0],
                 "triggerKind": "manual",
-            ] as [String: Any])
+            ] as [String: any Sendable])
         )
         await transport.pushMessage(try JSONEncoder().encode(nesRequest))
 
@@ -322,7 +322,7 @@ final class ACPAgentTests: XCTestCase {
                     "start": ["line": 0, "character": 0],
                     "end": ["line": 20, "character": 0],
                 ],
-            ] as [String: Any])
+            ] as [String: any Sendable])
         )
         await transport.pushMessage(try JSONEncoder().encode(document))
 
@@ -389,7 +389,8 @@ final class ACPAgentTests: XCTestCase {
 
         await transport.pushMessage(try JSONEncoder().encode(JSONRPCResponse(
             id: elicitationRequest.id,
-            result: AnyCodable(["action": "accept", "content": ["value": "ok"]]),
+            result: AnyCodable(
+                ["action": "accept", "content": ["value": "ok"]] as [String: any Sendable]),
             error: nil
         )))
 
@@ -402,7 +403,7 @@ final class ACPAgentTests: XCTestCase {
     }
 
     func testClientRequestRouterRoutesDraftMethods() async throws {
-        let router = ACPRequestRouter(encoder: JSONEncoder(), decoder: JSONDecoder())
+        let router = ACPRequestRouter()
         let delegate = RecordingClientDelegate()
         await router.setDelegate(delegate)
 
@@ -426,7 +427,7 @@ final class ACPAgentTests: XCTestCase {
                 "requestId": 12,
                 "elicitationId": "elicit-1",
                 "url": "https://example.com",
-            ] as [String: Any])
+            ] as [String: any Sendable])
         )
         let elicitationResult = try await router.routeRequest(elicitation)
         let elicitationData = try JSONEncoder().encode(elicitationResult)

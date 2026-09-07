@@ -7,21 +7,22 @@
 
 import Foundation
 import ACPModel
+import YYJSON
 
 actor ACPRequestRouter {
     // MARK: - Properties
 
-    private let encoder: JSONEncoder
-    private let decoder: JSONDecoder
+    /// The router's own coders: the yyjson coders are value types that are
+    /// not `Sendable`, so each actor builds its pair instead of sharing
+    /// the client's.
+    private let encoder = YYJSONEncoder()
+    private let decoder = YYJSONDecoder()
 
     weak var delegate: ClientDelegate?
 
     // MARK: - Initialization
 
-    init(encoder: JSONEncoder, decoder: JSONDecoder) {
-        self.encoder = encoder
-        self.decoder = decoder
-    }
+    init() {}
 
     // MARK: - Delegate Management
 

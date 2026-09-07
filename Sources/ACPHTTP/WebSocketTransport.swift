@@ -9,6 +9,7 @@ import Foundation
 import os.log
 import ACP
 import ACPModel
+import YYJSON
 
 /// Transport implementation using WebSocket for network communication.
 /// Works on all Apple platforms (iOS, macOS, tvOS, watchOS).
@@ -121,14 +122,14 @@ public actor WebSocketTransport: Transport {
 public actor WebSocketClient {
     private let transport: WebSocketTransport
     private let client: Client
-    private let decoder: JSONDecoder
-    private let encoder: JSONEncoder
+    private let decoder: YYJSONDecoder
+    private let encoder: YYJSONEncoder
 
     public init(url: URL) {
         self.transport = WebSocketTransport(url: url)
         self.client = Client()
-        self.decoder = JSONDecoder()
-        self.encoder = JSONEncoder()
+        self.decoder = YYJSONDecoder()
+        self.encoder = YYJSONEncoder()
     }
 
     /// Connect to the WebSocket server and initialize the client

@@ -456,13 +456,17 @@ final class ACPE2ETests: XCTestCase {
 
         try await client.launch(agentPath: mockAgentPath)
 
-        var debugMessages: [DebugMessage] = []
-        let debugTask = Task {
-            guard let stream = await client.debugMessages else { return }
+        // The collector is the task's own and comes back as its value: a
+        // task's closure is `sending`, and a variable appended inside it
+        // and read outside it is the race Swift 6 refuses.
+        let debugTask = Task { () -> [DebugMessage] in
+            guard let stream = await client.debugMessages else { return [] }
+            var messages: [DebugMessage] = []
             for await message in stream {
-                debugMessages.append(message)
-                if debugMessages.count >= 2 { break }
+                messages.append(message)
+                if messages.count >= 2 { break }
             }
+            return messages
         }
 
         _ = try await client.initialize(capabilities: makeCapabilities(), timeout: 5.0)
@@ -472,6 +476,7 @@ final class ACPE2ETests: XCTestCase {
 
         await client.terminate()
         debugTask.cancel()
+        let debugMessages = await debugTask.value
 
         XCTAssertGreaterThanOrEqual(debugMessages.count, 1)
 
@@ -846,7 +851,7 @@ final class ACPTypeIntegrationTests: XCTestCase {
                 "prompt": [
                     ["type": "text", "text": "Hello, agent!"]
                 ]
-            ] as [String: Any])
+            ] as [String: any Sendable])
         )
 
         let encoder = JSONEncoder()

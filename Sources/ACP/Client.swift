@@ -8,6 +8,7 @@
 import Foundation
 import os.log
 import ACPModel
+import YYJSON
 
 // MARK: - Debug Message Types
 
@@ -64,16 +65,18 @@ public actor Client {
     nonisolated(unsafe) private var closedSink: (@Sendable () -> Void)?
     nonisolated(unsafe) private var notificationsYielded = 0
     nonisolated(unsafe) private var debugContinuation: AsyncStream<DebugMessage>.Continuation?
-    /// The read queue's own decoder, never shared with the actor's.
-    private let receiveDecoder = JSONDecoder()
     /// The notification methods the request router handles for a delegate
     /// — the only ones worth a hop onto its actor.
     private static let routedNotificationMethods: Set<String> = ["mcp/message", "elicitation/complete"]
 
     private var debugStream: AsyncStream<DebugMessage>?
 
-    private let decoder: JSONDecoder
-    private let encoder: JSONEncoder
+    /// This actor's own coders — yyjson's, value types that are not
+    /// `Sendable`, so the router, the error handler, and the read queue
+    /// each build theirs instead of sharing these. The writer escapes no
+    /// slash by default, which is what Foundation's needed telling.
+    private let decoder: YYJSONDecoder
+    private let encoder: YYJSONEncoder
 
     public weak var delegate: ClientDelegate?
 
@@ -85,9 +88,8 @@ public actor Client {
     /// of its own, the app decides per client. `.unspecified` leaves plain
     /// queues and plain handlers.
     public init(qos: DispatchQoS = .unspecified) {
-        decoder = JSONDecoder()
-        encoder = JSONEncoder()
-        encoder.outputFormatting = [.withoutEscapingSlashes]
+        decoder = YYJSONDecoder()
+        encoder = YYJSONEncoder()
 
         var continuation: AsyncStream<JSONRPCNotification>.Continuation!
         notificationStream = AsyncStream { cont in
@@ -95,9 +97,9 @@ public actor Client {
         }
         notificationContinuation = continuation
 
-        processManager = ACPProcessManager(encoder: encoder, decoder: decoder, qos: qos)
-        requestRouter = ACPRequestRouter(encoder: encoder, decoder: decoder)
-        errorHandler = ErrorHandler(encoder: encoder)
+        processManager = ACPProcessManager(qos: qos)
+        requestRouter = ACPRequestRouter()
+        errorHandler = ErrorHandler()
 
         // Installed synchronously, before any launch can race them: the
         // frames arrive on the reader's queue and `receive` classifies them
@@ -1136,7 +1138,9 @@ public actor Client {
                 return
             }
 
-            let message = try receiveDecoder.decode(Message.self, from: data)
+            // The read queue's own decoder, built per frame on this path —
+            // a value type of options, its cost is in the decode.
+            let message = try YYJSONDecoder().decode(Message.self, from: data)
 
             switch message {
             case .response(let response):
@@ -1284,24 +1288,26 @@ public actor Client {
     }
 
     nonisolated private func extractMethod(from data: Data) -> String? {
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        guard let json = try? YYJSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
         return json["method"] as? String
     }
 
+    /// Encodes ONCE, here on this actor, and hands the bytes to the process
+    /// actor: the generic value is not `Sendable` and could not cross, and
+    /// the debug stream used to pay a second encode of its own.
     private func writeMessageWithDebug<T: Encodable>(_ message: T, method: String? = nil) async throws {
+        let data = try encoder.encode(message)
         if let continuation = currentDebugContinuation() {
-            if let data = try? encoder.encode(message) {
-                continuation.yield(DebugMessage(
-                    direction: .outgoing,
-                    timestamp: Date(),
-                    rawData: data,
-                    method: method
-                ))
-            }
+            continuation.yield(DebugMessage(
+                direction: .outgoing,
+                timestamp: Date(),
+                rawData: data,
+                method: method
+            ))
         }
-        try await processManager.writeMessage(message)
+        try await processManager.writeMessage(data)
     }
 }
 

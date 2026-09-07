@@ -9,6 +9,7 @@
 import Foundation
 import Darwin
 import os.log
+import YYJSON
 
 public actor ProcessRegistry {
     public static let shared = ProcessRegistry()
@@ -118,12 +119,12 @@ public actor ProcessRegistry {
 
     private func loadEntries() -> [Entry] {
         guard let data = try? Data(contentsOf: registryURL) else { return [] }
-        return (try? JSONDecoder().decode([Entry].self, from: data)) ?? []
+        return (try? YYJSONDecoder().decode([Entry].self, from: data)) ?? []
     }
 
     private func writeEntries(_ entries: [Entry]) {
         do {
-            let data = try JSONEncoder().encode(entries)
+            let data = try YYJSONEncoder().encode(entries)
             try data.write(to: registryURL, options: [.atomic])
         } catch {
             logger.error("Failed to write ACP registry: \(error.localizedDescription)")

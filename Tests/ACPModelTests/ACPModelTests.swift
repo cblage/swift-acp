@@ -654,7 +654,7 @@ final class ACPModelTests: XCTestCase {
 
     func testAnyCodableWithDict() throws {
         let encoder = JSONEncoder()
-        let value = AnyCodable(["key": "value", "number": 123] as [String: Any])
+        let value = AnyCodable(["key": "value", "number": 123] as [String: any Sendable])
         let data = try encoder.encode(value)
         let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
 
