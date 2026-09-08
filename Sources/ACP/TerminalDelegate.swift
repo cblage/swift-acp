@@ -374,13 +374,18 @@ public actor TerminalDelegate {
 
     /// What the pipes hold right now, read on the spot — a reply carries
     /// the output up to the moment it was asked for, not up to the last
-    /// readable event. The descriptors are non-blocking; a closed one
-    /// answers with an error the drain returns on.
+    /// readable event. THROUGH THE LIVE SOURCES' DESCRIPTORS, NEVER THE
+    /// FILE HANDLES: a source at EOF cancels itself and its cancel
+    /// handler closes the handle, and a closed `NSFileHandle`'s
+    /// `fileDescriptor` does not answer -1 — it raises
+    /// `NSFileHandleOperationException`, an Objective-C exception no
+    /// Swift frame catches, worded with whatever `errno` holds (the
+    /// previous pipe's EAGAIN). A cancelled source is at EOF and holds
+    /// nothing more; the descriptors are non-blocking.
     private func drainAvailableOutput(terminalId: String) {
         guard let state = terminals[terminalId] else { return }
-        for pipe in [state.process.standardOutput, state.process.standardError] {
-            guard let pipe = pipe as? Pipe else { continue }
-            _ = drain(fd: pipe.fileHandleForReading.fileDescriptor, into: terminalId)
+        for source in state.sources where !source.isCancelled {
+            _ = drain(fd: Int32(source.handle), into: terminalId)
         }
     }
 
