@@ -14,7 +14,7 @@ import ACPModel
 actor ACPProcessManager {
     // MARK: - Properties
 
-    private var process: Process?
+    private var process: ACPSpawnedProcess?
     private var processGroupId: pid_t?
     private var stdinPipe: Pipe?
     private var stdoutPipe: Pipe?
@@ -83,8 +83,6 @@ actor ACPProcessManager {
             throw ClientError.invalidResponse
         }
 
-        let proc = Process()
-
         let resolvedPath = (try? FileManager.default.destinationOfSymbolicLink(atPath: agentPath)) ?? agentPath
         let actualPath = resolvedPath.hasPrefix("/") ? resolvedPath : ((agentPath as NSString).deletingLastPathComponent as NSString).appendingPathComponent(resolvedPath)
 
@@ -96,6 +94,8 @@ actor ACPProcessManager {
             return firstLine.hasPrefix("#!/usr/bin/env node")
         }()
 
+        let executable: String
+        let argv: [String]
         if isNodeScript {
             let searchPaths = [
                 (agentPath as NSString).deletingLastPathComponent,
@@ -115,15 +115,15 @@ actor ACPProcessManager {
             }
 
             if let nodePath = foundNode {
-                proc.executableURL = URL(fileURLWithPath: nodePath)
-                proc.arguments = [actualPath] + arguments
+                executable = nodePath
+                argv = [nodePath, actualPath] + arguments
             } else {
-                proc.executableURL = URL(fileURLWithPath: agentPath)
-                proc.arguments = arguments
+                executable = agentPath
+                argv = [agentPath] + arguments
             }
         } else {
-            proc.executableURL = URL(fileURLWithPath: agentPath)
-            proc.arguments = arguments
+            executable = agentPath
+            argv = [agentPath] + arguments
         }
 
         var environment = ShellEnvironment.loadUserShellEnvironment()
@@ -135,10 +135,11 @@ actor ACPProcessManager {
             }
         }
 
+        var childDirectory: String?
         if let workingDirectory, !workingDirectory.isEmpty {
             environment["PWD"] = workingDirectory
             environment["OLDPWD"] = workingDirectory
-            proc.currentDirectoryURL = URL(fileURLWithPath: workingDirectory)
+            childDirectory = workingDirectory
         }
 
         let agentDir = (agentPath as NSString).deletingLastPathComponent
@@ -149,44 +150,38 @@ actor ACPProcessManager {
             environment["PATH"] = agentDir
         }
 
-        proc.environment = environment
-
         let stdin = Pipe()
         let stdout = Pipe()
         let stderr = Pipe()
 
-        proc.standardInput = stdin
-        proc.standardOutput = stdout
-        proc.standardError = stderr
+        let pid = try Self.spawn(
+            executable, arguments: argv, environment: environment, workingDirectory: childDirectory,
+            stdin: stdin.fileHandleForReading.fileDescriptor,
+            stdout: stdout.fileHandleForWriting.fileDescriptor,
+            stderr: stderr.fileHandleForWriting.fileDescriptor
+        )
+        // The child's ends are the child's now: closed here, so the reader
+        // sees EOF when the agent exits and a write to a dead agent fails
+        // instead of filling a pipe nobody reads.
+        try? stdin.fileHandleForReading.close()
+        try? stdout.fileHandleForWriting.close()
+        try? stderr.fileHandleForWriting.close()
 
         stdinPipe = stdin
         stdoutPipe = stdout
         stderrPipe = stderr
 
-        proc.terminationHandler = { [weak self] process in
-            Task {
-                await self?.handleTermination(exitCode: process.terminationStatus)
-            }
-        }
-
-        try proc.run()
         stdinDescriptor = stdin.fileHandleForWriting.fileDescriptor
-        process = proc
-        processGroupId = nil
-        if proc.processIdentifier > 0 {
-            let pid = proc.processIdentifier
-            if setpgid(pid, pid) == 0 {
-                processGroupId = pid
-            } else {
-                logger.warning("Failed to set process group for pid=\(pid): \(String(cString: strerror(errno)))")
+        process = ACPSpawnedProcess(pid: pid) { [weak self] exitCode in
+            Task {
+                await self?.handleTermination(exitCode: exitCode)
             }
         }
-        if proc.processIdentifier > 0 {
-            let pid = proc.processIdentifier
-            let pgid = processGroupId
-            Task {
-                await ProcessRegistry.shared.recordProcess(pid: pid, pgid: pgid, agentPath: actualPath)
-            }
+        // The group is the spawn's: the child led it from its first
+        // instruction, so there is nothing to set here and nothing to fail.
+        processGroupId = pid
+        Task {
+            await ProcessRegistry.shared.recordProcess(pid: pid, pgid: pid, agentPath: actualPath)
         }
 
         var stderrContinuation: AsyncStream<String>.Continuation!
@@ -214,10 +209,10 @@ actor ACPProcessManager {
     }
 
     func processIdentifier() -> Int32? {
-        guard process?.isRunning == true, let pid = process?.processIdentifier, pid > 0 else {
+        guard let process, process.isRunning, process.pid > 0 else {
             return nil
         }
-        return pid
+        return process.pid
     }
 
     func processGroupIdentifier() -> Int32? {
@@ -233,7 +228,7 @@ actor ACPProcessManager {
     func terminate() async {
         let proc = process
         let pgid = processGroupId
-        let pid = proc?.processIdentifier
+        let pid = proc?.pid
 
         stdinDescriptor = -1
         try? stdinPipe?.fileHandleForWriting.close()
@@ -254,17 +249,17 @@ actor ACPProcessManager {
             if let pgid {
                 _ = killpg(pgid, SIGTERM)
             } else {
-                proc.terminate()
+                _ = kill(proc.pid, SIGTERM)
             }
         }
 
         if let proc {
             let exited = await waitForExit(proc, timeout: 2.0)
-            if !exited, proc.processIdentifier > 0 {
+            if !exited, proc.pid > 0 {
                 if let pgid {
                     _ = killpg(pgid, SIGKILL)
                 } else {
-                    _ = kill(proc.processIdentifier, SIGKILL)
+                    _ = kill(proc.pid, SIGKILL)
                 }
             }
         }
@@ -343,7 +338,7 @@ actor ACPProcessManager {
     // MARK: - Private Methods
 
     private func handleTermination(exitCode: Int32) async {
-        let pid = process?.processIdentifier
+        let pid = process?.pid
         let pgid = processGroupId
         // ORDERED AFTER THE LAST MESSAGE: the reader drains both pipes to
         // EOF on its own queue, delivering every frame still in them and
@@ -374,12 +369,119 @@ actor ACPProcessManager {
         await onTermination?(exitCode)
     }
 
-    private func waitForExit(_ proc: Process, timeout: TimeInterval) async -> Bool {
+    private func waitForExit(_ proc: ACPSpawnedProcess, timeout: TimeInterval) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while proc.isRunning, Date() < deadline {
             try? await Task.sleep(nanoseconds: 50_000_000)
         }
         return !proc.isRunning
+    }
+
+    /// THE SPAWN, `posix_spawn` with the child LEADING A PROCESS GROUP OF
+    /// ITS OWN FROM ITS FIRST INSTRUCTION — `POSIX_SPAWN_SETPGROUP` with
+    /// group 0, its pid — its stdio the three descriptors on 0, 1, and 2
+    /// and every other descriptor closed to it (`POSIX_SPAWN_CLOEXEC_DEFAULT`),
+    /// its signal mask empty and every disposition default, as Foundation's
+    /// `Process` spawns, and its working directory changed in the child.
+    /// The group is set at the spawn because `setpgid` from the parent
+    /// afterwards is a race the parent loses: it fails with EPERM once the
+    /// child has exec'd, and a child `posix_spawn` starts has exec'd before
+    /// the parent's next line as a rule — so the group was mostly never set,
+    /// and a terminate signalled the agent alone while the children it had
+    /// spawned outlived it. `Process` exposes no spawn attribute, so the
+    /// spawn is direct. Returns the pid; throws the spawn's errno.
+    private nonisolated static func spawn(
+        _ executable: String, arguments: [String], environment: [String: String],
+        workingDirectory: String?, stdin: Int32, stdout: Int32, stderr: Int32
+    ) throws -> pid_t {
+        var attributes: posix_spawnattr_t? = nil
+        guard posix_spawnattr_init(&attributes) == 0 else {
+            throw ClientError.transportError("cannot launch \(executable): posix_spawnattr_init failed")
+        }
+        defer { posix_spawnattr_destroy(&attributes) }
+        var noSignals = sigset_t()
+        sigemptyset(&noSignals)
+        var everySignal = sigset_t()
+        sigfillset(&everySignal)
+        posix_spawnattr_setsigmask(&attributes, &noSignals)
+        posix_spawnattr_setsigdefault(&attributes, &everySignal)
+        posix_spawnattr_setpgroup(&attributes, 0)
+        posix_spawnattr_setflags(
+            &attributes,
+            Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF)
+        )
+
+        var actions: posix_spawn_file_actions_t? = nil
+        guard posix_spawn_file_actions_init(&actions) == 0 else {
+            throw ClientError.transportError("cannot launch \(executable): posix_spawn_file_actions_init failed")
+        }
+        defer { posix_spawn_file_actions_destroy(&actions) }
+        posix_spawn_file_actions_adddup2(&actions, stdin, 0)
+        posix_spawn_file_actions_adddup2(&actions, stdout, 1)
+        posix_spawn_file_actions_adddup2(&actions, stderr, 2)
+        if let workingDirectory {
+            posix_spawn_file_actions_addchdir_np(&actions, workingDirectory)
+        }
+
+        let argv: [UnsafeMutablePointer<CChar>?] = arguments.map { strdup($0) } + [nil]
+        let envp: [UnsafeMutablePointer<CChar>?] = environment.map { strdup("\($0.key)=\($0.value)") } + [nil]
+        defer {
+            for pointer in argv { free(pointer) }
+            for pointer in envp { free(pointer) }
+        }
+        var pid: pid_t = 0
+        let code = posix_spawn(&pid, executable, &actions, &attributes, argv, envp)
+        guard code == 0 else {
+            throw ClientError.transportError("cannot launch \(executable): \(String(cString: strerror(code)))")
+        }
+        return pid
+    }
+}
+
+/// The agent's process as the spawn started it: its pid, which is also the
+/// process group it leads, and its exit — observed by a process source that
+/// reaps it and hands the status on ONCE, on the source's own queue, as
+/// `Process.terminationStatus` would report it: the exit code of a process
+/// that exited, the number of the signal that ended one.
+final class ACPSpawnedProcess: @unchecked Sendable {
+    let pid: pid_t
+    private let lock = NSLock()
+    private var exited = false
+    private var source: DispatchSourceProcess?
+
+    /// True until the exit has been reaped.
+    var isRunning: Bool {
+        lock.withLock { !exited }
+    }
+
+    init(pid: pid_t, onExit: @escaping @Sendable (Int32) -> Void) {
+        self.pid = pid
+        let source = DispatchSource.makeProcessSource(
+            identifier: pid, eventMask: .exit, queue: DispatchQueue(label: "org.acp.process.exit")
+        )
+        self.source = source
+        source.setEventHandler { [weak self] in
+            self?.reap(onExit, blocking: true)
+        }
+        source.resume()
+        // A child that exited between the spawn and the source's arming is a
+        // zombie the source may never report: reaped here if it has, and the
+        // source's own reap then finds nothing to take.
+        reap(onExit, blocking: false)
+    }
+
+    private func reap(_ onExit: @Sendable (Int32) -> Void, blocking: Bool) {
+        var raw: Int32 = 0
+        guard waitpid(pid, &raw, blocking ? 0 : WNOHANG) == pid else { return }
+        let signal = raw & 0x7f
+        let status = signal == 0 ? (raw >> 8) & 0xff : signal
+        lock.lock()
+        let first = !exited
+        exited = true
+        lock.unlock()
+        guard first else { return }
+        source?.cancel()
+        onExit(status)
     }
 }
 
