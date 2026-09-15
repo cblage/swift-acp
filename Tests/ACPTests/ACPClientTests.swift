@@ -691,6 +691,63 @@ final class ACPClientTests: XCTestCase {
         XCTAssertEqual(update.usage?.cost?.currency, "USD")
     }
 
+    // MARK: - Subagent Session Tests (ACP draft #1992)
+
+    func testSessionUpdateSubagentSpawned() throws {
+        // As the Claude and Codex adapters emit it.
+        let json = """
+        {
+            "sessionUpdate": "subagent_spawned",
+            "subagentSessionId": "01a0952b-3262-7643-a6cf-26929f60f173",
+            "name": "Tmp count 1",
+            "task": "Delegated task for Tmp count 1",
+            "capabilities": {}
+        }
+        """
+        let data = json.data(using: .utf8)!
+        let update = try JSONDecoder().decode(SessionUpdate.self, from: data)
+
+        XCTAssertEqual(update.sessionUpdateType, "subagent_spawned")
+        XCTAssertEqual(update.subagentSpawned?.subagentSessionId.value, "01a0952b-3262-7643-a6cf-26929f60f173")
+        XCTAssertEqual(update.subagentSpawned?.name, "Tmp count 1")
+        XCTAssertEqual(update.subagentSpawned?.task, "Delegated task for Tmp count 1")
+        XCTAssertNil(update.subagentSpawned?.capabilities.cancel)
+        XCTAssertNil(update.subagentSpawned?.capabilities.close)
+
+        let encoded = try JSONEncoder().encode(update)
+        let again = try JSONDecoder().decode(SessionUpdate.self, from: encoded)
+        XCTAssertEqual(again.sessionUpdateType, "subagent_spawned")
+        XCTAssertEqual(again.subagentSpawned?.name, "Tmp count 1")
+        XCTAssertEqual(again.subagentSpawned?.subagentSessionId.value, "01a0952b-3262-7643-a6cf-26929f60f173")
+    }
+
+    func testSessionUpdateSubagentStateUpdate() throws {
+        let json = """
+        {
+            "sessionUpdate": "subagent_state_update",
+            "subagentSessionId": "01a0952b-3262-7643-a6cf-26929f60f173",
+            "state": "completed"
+        }
+        """
+        let data = json.data(using: .utf8)!
+        let update = try JSONDecoder().decode(SessionUpdate.self, from: data)
+
+        XCTAssertEqual(update.sessionUpdateType, "subagent_state_update")
+        XCTAssertEqual(update.subagentStateUpdate?.subagentSessionId.value, "01a0952b-3262-7643-a6cf-26929f60f173")
+        XCTAssertEqual(update.subagentStateUpdate?.state, .completed)
+
+        // A word the draft does not name is kept as it came, refusing nothing.
+        let other = """
+        {"sessionUpdate": "subagent_state_update", "subagentSessionId": "kid", "state": "paused"}
+        """
+        let otherUpdate = try JSONDecoder().decode(SessionUpdate.self, from: other.data(using: .utf8)!)
+        XCTAssertEqual(otherUpdate.subagentStateUpdate?.state, .other("paused"))
+        XCTAssertEqual(otherUpdate.subagentStateUpdate?.state.rawValue, "paused")
+        let encoded = try JSONEncoder().encode(otherUpdate)
+        let again = try JSONDecoder().decode(SessionUpdate.self, from: encoded)
+        XCTAssertEqual(again.subagentStateUpdate?.state, .other("paused"))
+    }
+
     // MARK: - SessionConfigOption Tests
 
     func testSessionConfigOptionDecoding() throws {

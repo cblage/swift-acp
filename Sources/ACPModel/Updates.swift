@@ -76,6 +76,119 @@ public struct UsageUpdate: Codable, Sendable {
     }
 }
 
+// MARK: - Subagent Session Types
+//
+// The subagent session updates of the ACP draft (agent-client-protocol#1992,
+// the AIR extension the Claude and Codex adapters speak once a client
+// advertises `nativeSubagentSessions`): a child session announced to its
+// parent's, and its terminal state. Both ride the PARENT's session id.
+
+/// What a client may do to a subagent's session: the draft's two verbs,
+/// each absent until the agent advertises it.
+public struct SubagentSessionCapabilities: Codable, Sendable {
+    public let cancel: Bool?
+    public let close: Bool?
+    public let _meta: [String: AnyCodable]?
+
+    public init(cancel: Bool? = nil, close: Bool? = nil, _meta: [String: AnyCodable]? = nil) {
+        self.cancel = cancel
+        self.close = close
+        self._meta = _meta
+    }
+}
+
+/// A subagent's terminal state as the draft names it — and any other word
+/// the wire carries, kept as it came, so a newer adapter's word refuses no
+/// frame.
+public enum SubagentState: Codable, Sendable, Equatable {
+    case completed
+    case failed
+    case cancelled
+    case disconnected
+    case other(String)
+
+    public init(_ word: String) {
+        switch word {
+        case "completed": self = .completed
+        case "failed": self = .failed
+        case "cancelled": self = .cancelled
+        case "disconnected": self = .disconnected
+        default: self = .other(word)
+        }
+    }
+
+    public var rawValue: String {
+        switch self {
+        case .completed: return "completed"
+        case .failed: return "failed"
+        case .cancelled: return "cancelled"
+        case .disconnected: return "disconnected"
+        case .other(let word): return word
+        }
+    }
+
+    public init(from decoder: Decoder) throws {
+        self.init(try decoder.singleValueContainer().decode(String.self))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+}
+
+/// `subagent_spawned`: a subagent's session announced — the child's session
+/// id, its name, its task, and what the client may do to it.
+public struct SubagentSpawned: Codable, Sendable {
+    public let subagentSessionId: SessionId
+    public let name: String
+    public let task: String
+    public let capabilities: SubagentSessionCapabilities
+    public let _meta: [String: AnyCodable]?
+
+    enum CodingKeys: String, CodingKey {
+        case subagentSessionId, name, task, capabilities
+        case _meta
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        subagentSessionId = try container.decode(SessionId.self, forKey: .subagentSessionId)
+        name = try container.decode(String.self, forKey: .name)
+        task = try container.decode(String.self, forKey: .task)
+        capabilities = try container.decodeIfPresent(SubagentSessionCapabilities.self, forKey: .capabilities)
+            ?? SubagentSessionCapabilities()
+        _meta = try container.decodeIfPresent([String: AnyCodable].self, forKey: ._meta)
+    }
+
+    public init(
+        subagentSessionId: SessionId,
+        name: String,
+        task: String,
+        capabilities: SubagentSessionCapabilities = SubagentSessionCapabilities(),
+        _meta: [String: AnyCodable]? = nil
+    ) {
+        self.subagentSessionId = subagentSessionId
+        self.name = name
+        self.task = task
+        self.capabilities = capabilities
+        self._meta = _meta
+    }
+}
+
+/// `subagent_state_update`: a subagent's session reaching a terminal state.
+public struct SubagentStateUpdate: Codable, Sendable {
+    public let subagentSessionId: SessionId
+    public let state: SubagentState
+    public let _meta: [String: AnyCodable]?
+
+    public init(subagentSessionId: SessionId, state: SubagentState, _meta: [String: AnyCodable]? = nil) {
+        self.subagentSessionId = subagentSessionId
+        self.state = state
+        self._meta = _meta
+    }
+}
+
 public enum SessionInfoFieldUpdate<Value: Sendable>: Sendable {
     case omitted
     case clear
@@ -195,6 +308,8 @@ public enum SessionUpdate: Codable, Sendable {
     case configOptionUpdate([SessionConfigOption])
     case sessionInfoUpdate(SessionInfoUpdate)
     case usageUpdate(UsageUpdate)
+    case subagentSpawned(SubagentSpawned)
+    case subagentStateUpdate(SubagentStateUpdate)
 
     enum CodingKeys: String, CodingKey {
         case sessionUpdate
@@ -245,6 +360,12 @@ public enum SessionUpdate: Codable, Sendable {
         case "usage_update":
             let usage = try UsageUpdate(from: decoder)
             self = .usageUpdate(usage)
+        case "subagent_spawned":
+            let spawned = try SubagentSpawned(from: decoder)
+            self = .subagentSpawned(spawned)
+        case "subagent_state_update":
+            let state = try SubagentStateUpdate(from: decoder)
+            self = .subagentStateUpdate(state)
         default:
             throw DecodingError.dataCorruptedError(forKey: .sessionUpdate, in: container, debugDescription: "Unknown session update type: \(updateType)")
         }
@@ -296,6 +417,12 @@ public enum SessionUpdate: Codable, Sendable {
         case .usageUpdate(let usage):
             try container.encode("usage_update", forKey: .sessionUpdate)
             try usage.encode(to: encoder)
+        case .subagentSpawned(let spawned):
+            try container.encode("subagent_spawned", forKey: .sessionUpdate)
+            try spawned.encode(to: encoder)
+        case .subagentStateUpdate(let state):
+            try container.encode("subagent_state_update", forKey: .sessionUpdate)
+            try state.encode(to: encoder)
         }
     }
 }
@@ -422,6 +549,8 @@ extension SessionUpdate {
         case .configOptionUpdate: return "config_option_update"
         case .sessionInfoUpdate: return "session_info_update"
         case .usageUpdate: return "usage_update"
+        case .subagentSpawned: return "subagent_spawned"
+        case .subagentStateUpdate: return "subagent_state_update"
         }
     }
 
@@ -571,6 +700,20 @@ extension SessionUpdate {
     public var usage: UsageUpdate? {
         switch self {
         case .usageUpdate(let usage): return usage
+        default: return nil
+        }
+    }
+
+    public var subagentSpawned: SubagentSpawned? {
+        switch self {
+        case .subagentSpawned(let spawned): return spawned
+        default: return nil
+        }
+    }
+
+    public var subagentStateUpdate: SubagentStateUpdate? {
+        switch self {
+        case .subagentStateUpdate(let state): return state
         default: return nil
         }
     }
