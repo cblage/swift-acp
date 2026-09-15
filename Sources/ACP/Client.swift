@@ -64,6 +64,7 @@ public actor Client {
     nonisolated(unsafe) private var notificationSink: (@Sendable (JSONRPCNotification) -> Void)?
     nonisolated(unsafe) private var closedSink: (@Sendable () -> Void)?
     nonisolated(unsafe) private var stdoutLineSink: (@Sendable (String) -> Void)?
+    nonisolated(unsafe) private var wireTap: (@Sendable (DebugMessageDirection, Data) -> Void)?
     nonisolated(unsafe) private var notificationsYielded = 0
     nonisolated(unsafe) private var debugContinuation: AsyncStream<DebugMessage>.Continuation?
     /// The notification methods the request router handles for a delegate
@@ -168,6 +169,27 @@ public actor Client {
         receiveLock.lock()
         stdoutLineSink = handler
         receiveLock.unlock()
+    }
+
+    /// THE WIRE TAP: every frame in both directions, as the bytes on the
+    /// wire — an incoming frame on the read queue the moment it is framed
+    /// and before it is classified, notifications, responses, and the
+    /// agent's requests alike; an outgoing one on this actor after the
+    /// encode and before the write, requests, responses, and
+    /// notifications alike. A consumer keeping a record of the transmission
+    /// installs it before `launch` or `attach`; passing nil uninstalls it.
+    /// The tap must not block.
+    nonisolated public func setWireTap(_ tap: (@Sendable (DebugMessageDirection, Data) -> Void)?) {
+        receiveLock.lock()
+        wireTap = tap
+        receiveLock.unlock()
+    }
+
+    /// A connection to an agent the caller plays itself, in place of
+    /// `launch`: frames read from `stdout` and written to `stdin`, the read
+    /// end's EOF the agent's end — see `ACPProcessManager.attach`.
+    public func attach(reading stdout: FileHandle, writing stdin: FileHandle) async throws {
+        try await processManager.attach(reading: stdout, writing: stdin)
     }
 
     /// How many notifications have been delivered so far — to the handler
@@ -1144,6 +1166,11 @@ public actor Client {
             return
         }
 
+        receiveLock.lock()
+        let tap = wireTap
+        receiveLock.unlock()
+        tap?(.incoming, data)
+
         if let continuation = currentDebugContinuation() {
             let method = header.method ?? extractMethod(from: data)
             continuation.yield(DebugMessage(
@@ -1340,6 +1367,10 @@ public actor Client {
     /// the debug stream used to pay a second encode of its own.
     private func writeMessageWithDebug<T: Encodable>(_ message: T, method: String? = nil) async throws {
         let data = try encoder.encode(message)
+        // The scoped form: a bare lock/unlock pair is not allowed across
+        // an async context.
+        let tap = receiveLock.withLock { wireTap }
+        tap?(.outgoing, data)
         if let continuation = currentDebugContinuation() {
             continuation.yield(DebugMessage(
                 direction: .outgoing,

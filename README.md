@@ -223,6 +223,20 @@ client.setStdoutLineHandler { line in
 }
 ```
 
+The whole transmission, both ways, reaches a wire tap as the bytes on the wire — every incoming frame the moment it is framed, before it is classified, and every outgoing one after the encode, before the write — for a client keeping a record of it:
+
+```swift
+client.setWireTap { direction, bytes in
+    journal.append(direction == .incoming ? .rx : .tx, bytes)
+}
+```
+
+And a client can be attached to an agent the caller plays itself, in place of a launch — two file handles, one read as the agent's stdout and one written as its stdin, the read end's EOF the agent's end — which is how a recorded transmission plays back through the live client:
+
+```swift
+try await client.attach(reading: recording.fileHandleForReading, writing: answers.fileHandleForWriting)
+```
+
 The handler runs synchronously on the client's read queue and must not block; install it before `launch`.
 
 ### 8. Session Management

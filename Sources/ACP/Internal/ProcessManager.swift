@@ -23,6 +23,11 @@ actor ACPProcessManager {
     /// The running process's stdout and stderr, read and framed on the
     /// reader's own serial queue — see `ACPOutputReader`.
     private var reader: ACPOutputReader?
+    /// A CONNECTION WITHOUT A PROCESS (`attach`): the agent's side is two
+    /// file handles the caller owns, read and written exactly as a spawned
+    /// agent's pipes are, its end the read end's EOF.
+    private var attached = false
+    private var attachedStdin: FileHandle?
 
     private let logger: Logger
 
@@ -79,8 +84,56 @@ actor ACPProcessManager {
 
     // MARK: - Process Lifecycle
 
+    /// Attaches to an agent the caller plays itself: `stdout` is read and
+    /// framed by the same reader a spawned agent gets — every frame to
+    /// `onMessage`, every set-aside run to `onStdoutLine` — and every
+    /// message written goes to `stdin`. The read end's EOF is the agent's
+    /// end, reported through `onTermination` with code 0 once every frame
+    /// still buffered has been delivered. A journal played back through the
+    /// live client is the caller: the recorded frames arrive on `stdout`
+    /// and the client's own requests leave on `stdin` as they would to a
+    /// process.
+    func attach(reading stdout: FileHandle, writing stdin: FileHandle) throws {
+        guard process == nil, !attached else {
+            throw ClientError.invalidResponse
+        }
+        attached = true
+        attachedStdin = stdin
+        stdinDescriptor = stdin.fileDescriptor
+        // No stderr to read: a pipe whose write end is closed at once, so
+        // the reader's stderr source meets EOF and cancels itself.
+        let stderr = Pipe()
+        try? stderr.fileHandleForWriting.close()
+
+        var stderrContinuation: AsyncStream<String>.Continuation!
+        stderrLineStream = AsyncStream { stderrContinuation = $0 }
+        stderrLineContinuation = stderrContinuation
+        let lines = stderrContinuation!
+
+        handlerLock.lock()
+        let onMessage = self.onMessage
+        let onStdoutLine = self.onStdoutLine
+        handlerLock.unlock()
+        let reader = ACPOutputReader(
+            stdout: stdout,
+            stderr: stderr.fileHandleForReading,
+            logger: logger,
+            qos: qos,
+            onMessage: { data, header in onMessage?(data, header) },
+            onStdoutLine: { line in onStdoutLine?(line) },
+            onStderrLine: { line in lines.yield(line) },
+            onStdoutEnd: { [weak self] in
+                Task {
+                    await self?.handleTermination(exitCode: 0)
+                }
+            }
+        )
+        self.reader = reader
+        reader.start()
+    }
+
     func launch(agentPath: String, arguments: [String] = [], workingDirectory: String? = nil, environment customEnvironment: [String: String]? = nil) throws {
-        guard process == nil else {
+        guard process == nil, !attached else {
             throw ClientError.invalidResponse
         }
 
@@ -208,7 +261,7 @@ actor ACPProcessManager {
     }
 
     func isRunning() -> Bool {
-        return process?.isRunning == true
+        return process?.isRunning == true || attached
     }
 
     func processIdentifier() -> Int32? {
@@ -224,11 +277,27 @@ actor ACPProcessManager {
     }
 
     func stderrLines() -> AsyncStream<String>? {
-        guard process != nil else { return nil }
+        guard process != nil || attached else { return nil }
         return stderrLineStream
     }
 
     func terminate() async {
+        if attached {
+            // The attached agent's end: its stdin closed, the reader
+            // stopped without draining, nothing to signal.
+            stdinDescriptor = -1
+            try? attachedStdin?.close()
+            attachedStdin = nil
+            if let reader {
+                await reader.stop()
+                self.reader = nil
+            }
+            stderrLineContinuation?.finish()
+            stderrLineContinuation = nil
+            stderrLineStream = nil
+            attached = false
+            return
+        }
         let proc = process
         let pgid = processGroupId
         let pid = proc?.pid
@@ -282,7 +351,7 @@ actor ACPProcessManager {
     /// value is not `Sendable`, and the client encodes once anyway.
     func writeMessage(_ data: Data) async throws {
         let fd = stdinDescriptor
-        guard fd >= 0, let proc = process, proc.isRunning else {
+        guard fd >= 0, process?.isRunning == true || attached else {
             throw ClientError.processNotRunning
         }
 
@@ -350,6 +419,7 @@ actor ACPProcessManager {
     private func handleTermination(exitCode: Int32) async {
         let pid = process?.pid
         let pgid = processGroupId
+        let wasAttached = attached
         // ORDERED AFTER THE LAST MESSAGE: the reader drains both pipes to
         // EOF on its own queue, delivering every frame still in them and
         // the framer's remainder, before this resumes — so the termination
@@ -365,6 +435,9 @@ actor ACPProcessManager {
 
         stdinDescriptor = -1
         try? stdinPipe?.fileHandleForWriting.close()
+        try? attachedStdin?.close()
+        attachedStdin = nil
+        attached = false
         stdinPipe = nil
         stdoutPipe = nil
         stderrPipe = nil
@@ -372,7 +445,9 @@ actor ACPProcessManager {
         processGroupId = nil
 
         logger.info("Agent process terminated with code: \(exitCode)")
-        await ProcessRegistry.shared.removeProcess(pid: pid, pgid: pgid)
+        if !wasAttached {
+            await ProcessRegistry.shared.removeProcess(pid: pid, pgid: pgid)
+        }
         // The scoped form: a bare lock/unlock pair is not allowed across
         // an async context, and nothing here awaits inside it.
         let onTermination = handlerLock.withLock { self.onTermination }
@@ -546,6 +621,9 @@ final class ACPOutputReader: @unchecked Sendable {
     /// What the framer sets aside as not a frame, as text — see `setAside`.
     private let onStdoutLine: @Sendable (String) -> Void
     private let onStderrLine: @Sendable (String) -> Void
+    /// Stdout's EOF, reported once — an attached agent's end, where a
+    /// spawned agent's is its exit.
+    private let onStdoutEnd: (@Sendable () -> Void)?
 
     // Confined to `queue` from here on.
     private var stdoutSource: DispatchSourceRead?
@@ -553,6 +631,7 @@ final class ACPOutputReader: @unchecked Sendable {
     private var stdoutOpen = true
     private var stderrOpen = true
     private var ended = false
+    private var stdoutEndReported = false
     private var chunk = [UInt8](repeating: 0, count: 65536)
 
     private var readBuffer = Data()
@@ -599,7 +678,8 @@ final class ACPOutputReader: @unchecked Sendable {
         qos: DispatchQoS,
         onMessage: @escaping @Sendable (Data, ACPFrameHeader) -> Void,
         onStdoutLine: @escaping @Sendable (String) -> Void,
-        onStderrLine: @escaping @Sendable (String) -> Void
+        onStderrLine: @escaping @Sendable (String) -> Void,
+        onStdoutEnd: (@Sendable () -> Void)? = nil
     ) {
         self.stdout = stdout
         self.stderr = stderr
@@ -610,6 +690,7 @@ final class ACPOutputReader: @unchecked Sendable {
         self.onMessage = onMessage
         self.onStdoutLine = onStdoutLine
         self.onStderrLine = onStderrLine
+        self.onStdoutEnd = onStdoutEnd
     }
 
     func start() {
@@ -662,6 +743,10 @@ final class ACPOutputReader: @unchecked Sendable {
             if self.drain(isStdout: isStdout) {
                 // EOF: the writer is gone; nothing more will ever arrive.
                 (isStdout ? self.stdoutSource : self.stderrSource)?.cancel()
+                if isStdout, !self.stdoutEndReported {
+                    self.stdoutEndReported = true
+                    self.onStdoutEnd?()
+                }
             }
         }
         source.setCancelHandler { [weak self] in
