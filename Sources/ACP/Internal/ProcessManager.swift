@@ -31,6 +31,7 @@ actor ACPProcessManager {
     /// under a lock rather than on the actor.
     private let handlerLock = NSLock()
     nonisolated(unsafe) private var onMessage: (@Sendable (Data, ACPFrameHeader) -> Void)?
+    nonisolated(unsafe) private var onStdoutLine: (@Sendable (String) -> Void)?
     nonisolated(unsafe) private var onTermination: (@Sendable (Int32) async -> Void)?
 
     /// Stdin writes run HERE, never on the actor: a write to a full pipe
@@ -191,6 +192,7 @@ actor ACPProcessManager {
 
         handlerLock.lock()
         let onMessage = self.onMessage
+        let onStdoutLine = self.onStdoutLine
         handlerLock.unlock()
         let reader = ACPOutputReader(
             stdout: stdout.fileHandleForReading,
@@ -198,6 +200,7 @@ actor ACPProcessManager {
             logger: logger,
             qos: qos,
             onMessage: { data, header in onMessage?(data, header) },
+            onStdoutLine: { line in onStdoutLine?(line) },
             onStderrLine: { line in lines.yield(line) }
         )
         self.reader = reader
@@ -323,14 +326,21 @@ actor ACPProcessManager {
 
     /// Installs the receive and termination handlers. `onMessage` is called
     /// SYNCHRONOUSLY on the reader's queue with each complete frame and the
-    /// header its walk read, in order; `onTermination` runs on this actor
-    /// once every frame the pipes still held has been delivered.
+    /// header its walk read, in order; `onStdoutLine` on the same queue, in
+    /// order with the frames around it, with every run of stdout bytes the
+    /// framer set aside as not a frame — a line of text, a prefix before a
+    /// frame, a line that opened like JSON and never closed — so an agent's
+    /// own words on its JSON channel reach the client instead of the log
+    /// alone; `onTermination` runs on this actor once every frame the pipes
+    /// still held has been delivered.
     nonisolated func setHandlers(
         onMessage: @escaping @Sendable (Data, ACPFrameHeader) -> Void,
+        onStdoutLine: @escaping @Sendable (String) -> Void,
         onTermination: @escaping @Sendable (Int32) async -> Void
     ) {
         handlerLock.lock()
         self.onMessage = onMessage
+        self.onStdoutLine = onStdoutLine
         self.onTermination = onTermination
         handlerLock.unlock()
     }
@@ -533,6 +543,8 @@ final class ACPOutputReader: @unchecked Sendable {
     private let stderr: FileHandle
     private let logger: Logger
     private let onMessage: @Sendable (Data, ACPFrameHeader) -> Void
+    /// What the framer sets aside as not a frame, as text — see `setAside`.
+    private let onStdoutLine: @Sendable (String) -> Void
     private let onStderrLine: @Sendable (String) -> Void
 
     // Confined to `queue` from here on.
@@ -586,6 +598,7 @@ final class ACPOutputReader: @unchecked Sendable {
         logger: Logger,
         qos: DispatchQoS,
         onMessage: @escaping @Sendable (Data, ACPFrameHeader) -> Void,
+        onStdoutLine: @escaping @Sendable (String) -> Void,
         onStderrLine: @escaping @Sendable (String) -> Void
     ) {
         self.stdout = stdout
@@ -595,6 +608,7 @@ final class ACPOutputReader: @unchecked Sendable {
         self.enforced = qos == .unspecified ? [] : [.enforceQoS]
         self.queue = DispatchQueue(label: "org.acp.process.read", qos: qos)
         self.onMessage = onMessage
+        self.onStdoutLine = onStdoutLine
         self.onStderrLine = onStderrLine
     }
 
@@ -763,20 +777,29 @@ final class ACPOutputReader: @unchecked Sendable {
                 }
                 let first = readBuffer[start]
                 if first != 0x7B && first != 0x5B {
-                    if let jsonStart = readBuffer[start...].firstIndex(where: { $0 == 0x7B || $0 == 0x5B }) {
-                        logger.debug("Discarded \(jsonStart - start) non-JSON prefix bytes before JSON start")
-                        readOffset = jsonStart
-                        scanIndex = jsonStart
-                        continue
-                    }
-                    if let newline = readBuffer[start...].firstIndex(of: 0x0A) {
-                        logger.debug("Discarded non-JSON stdout line (\(newline - start) bytes)")
+                    // NOT A FRAME: a whole line of text when the line ends
+                    // before any frame opens on it, else the prefix before
+                    // the frame that opens on it — each set aside to
+                    // `onStdoutLine`, never to the log alone.
+                    let newline = readBuffer[start...].firstIndex(of: 0x0A)
+                    let jsonStart = readBuffer[start...].firstIndex(where: { $0 == 0x7B || $0 == 0x5B })
+                    if let newline, jsonStart.map({ newline < $0 }) ?? true {
+                        logger.debug("Set aside non-JSON stdout line (\(newline - start) bytes)")
+                        setAside(start..<newline)
                         readOffset = newline + 1
                         scanIndex = readOffset
                         continue
                     }
+                    if let jsonStart {
+                        logger.debug("Set aside \(jsonStart - start) non-JSON prefix bytes before JSON start")
+                        setAside(start..<jsonStart)
+                        readOffset = jsonStart
+                        scanIndex = jsonStart
+                        continue
+                    }
                     if count - start > 4096 {
-                        logger.warning("Discarding \(count - start) bytes of non-JSON stdout")
+                        logger.warning("Setting aside \(count - start) bytes of non-JSON stdout")
+                        setAside(start..<count)
                         resetReadState()
                     }
                     return nil
@@ -911,7 +934,8 @@ final class ACPOutputReader: @unchecked Sendable {
             headerHasId = hasId
 
             if let malformedLineEnd {
-                logger.warning("Discarded malformed JSON stdout line (\(malformedLineEnd - self.readOffset) bytes)")
+                logger.warning("Set aside malformed JSON stdout line (\(malformedLineEnd - self.readOffset) bytes)")
+                setAside(readOffset..<malformedLineEnd)
                 readOffset = malformedLineEnd + 1
                 scanIndex = readOffset
                 scanDepth = 0
@@ -937,6 +961,18 @@ final class ACPOutputReader: @unchecked Sendable {
             compactReadBuffer()
             return (message, header)
         }
+    }
+
+    /// Bytes the framer sets aside as not a frame go out as text to
+    /// `onStdoutLine`, a trailing carriage return dropped as a stderr
+    /// line's is, on the read queue in their place among the frames — an
+    /// agent's own words on its JSON channel, a login URL to open or a
+    /// diagnostic, are the client's to read.
+    private func setAside(_ range: Range<Int>) {
+        var bytes = readBuffer.subdata(in: range)
+        if bytes.last == 0x0D { bytes.removeLast() }
+        guard !bytes.isEmpty else { return }
+        onStdoutLine(String(decoding: bytes, as: UTF8.self))
     }
 
     private func resetHeaderState() {

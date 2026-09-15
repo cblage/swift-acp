@@ -57,6 +57,67 @@ final class ACPE2ETests: XCTestCase {
         await client.terminate()
     }
 
+    /// What the framer sets aside, in order with the frames: a whole line
+    /// of text, the prefix before a frame that opens on its line, and a
+    /// line that opened like JSON and never closed — each to the stdout
+    /// line handler as text — while the frames around them still arrive.
+    func testStdoutLinesThatAreNotFramesReachTheLineHandlerInOrderWithTheFrames() async throws {
+        try createMockAgent(script: """
+        echo 'Open the following link to authenticate the ACP server: https://accounts.google.com/o/oauth2/auth?x=1'
+        echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"}}}}'
+        echo 'opening config {'
+        echo 'warning: {"jsonrpc":"2.0","method":"noted","params":{}}'
+        trap 'exit 0' TERM
+        sleep 10
+        """)
+
+        let seen = Seen()
+        let client = Client()
+        client.setStdoutLineHandler { line in seen.add(line: line) }
+        client.setNotificationHandler { notification in seen.add(method: notification.method) }
+        try await client.launch(agentPath: mockAgentPath)
+
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline, seen.snapshot().lines.count < 4 || seen.snapshot().methods.count < 2 {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let snapshot = seen.snapshot()
+        await client.terminate()
+
+        XCTAssertEqual(snapshot.lines, [
+            "Open the following link to authenticate the ACP server: https://accounts.google.com/o/oauth2/auth?x=1",
+            "opening config ",
+            "{",
+            "warning: ",
+        ])
+        XCTAssertEqual(snapshot.methods, ["session/update", "noted"])
+    }
+
+    /// What the two handlers saw, under a lock: both run on the read queue.
+    private final class Seen: @unchecked Sendable {
+        private let lock = NSLock()
+        private var lines: [String] = []
+        private var methods: [String] = []
+
+        func add(line: String) {
+            lock.lock()
+            lines.append(line)
+            lock.unlock()
+        }
+
+        func add(method: String) {
+            lock.lock()
+            methods.append(method)
+            lock.unlock()
+        }
+
+        func snapshot() -> (lines: [String], methods: [String]) {
+            lock.lock()
+            defer { lock.unlock() }
+            return (lines, methods)
+        }
+    }
+
     func testInitializeRequest() async throws {
         try createMockAgent(script: """
         # Read request and send response

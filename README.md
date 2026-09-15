@@ -212,6 +212,19 @@ Task {
 }
 ```
 
+What the agent writes on stdout that is not a frame — a line of text, a prefix before a frame, a line that opened like JSON and never closed — is set aside by the framer and handed to a handler as text, in its place among the frames, instead of being logged and dropped. An agent that prints a login URL for the client to open, or a diagnostic, is read this way:
+
+```swift
+client.setStdoutLineHandler { line in
+    if let last = line.split(separator: " ").last, let url = URL(string: String(last)),
+       url.scheme == "https" {
+        NSWorkspace.shared.open(url)
+    }
+}
+```
+
+The handler runs synchronously on the client's read queue and must not block; install it before `launch`.
+
 ### 8. Session Management
 
 ```swift

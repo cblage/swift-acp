@@ -63,6 +63,7 @@ public actor Client {
     private let receiveLock = NSLock()
     nonisolated(unsafe) private var notificationSink: (@Sendable (JSONRPCNotification) -> Void)?
     nonisolated(unsafe) private var closedSink: (@Sendable () -> Void)?
+    nonisolated(unsafe) private var stdoutLineSink: (@Sendable (String) -> Void)?
     nonisolated(unsafe) private var notificationsYielded = 0
     nonisolated(unsafe) private var debugContinuation: AsyncStream<DebugMessage>.Continuation?
     /// The notification methods the request router handles for a delegate
@@ -122,6 +123,7 @@ public actor Client {
         // there, without a hop onto this actor.
         processManager.setHandlers(
             onMessage: { [weak self] data, header in self?.receive(data, header: header) },
+            onStdoutLine: { [weak self] line in self?.receiveStdoutLine(line) },
             onTermination: { [weak self] exitCode in await self?.handleTermination(exitCode: exitCode) }
         )
     }
@@ -151,6 +153,20 @@ public actor Client {
         receiveLock.lock()
         notificationSink = handler
         closedSink = handler == nil ? nil : onClosed
+        receiveLock.unlock()
+    }
+
+    /// Delivers every run of stdout bytes the framer set aside as not a
+    /// frame — a line of text, a prefix before a frame, a line that opened
+    /// like JSON and never closed — SYNCHRONOUSLY on the read queue, as
+    /// text, in its place among the frames around it. An agent that writes
+    /// its own words on its JSON channel — a login URL for the client to
+    /// open, a diagnostic — reaches the client here instead of the log
+    /// alone. The handler must not block. Passing nil uninstalls it; with
+    /// none installed the bytes are logged and dropped.
+    nonisolated public func setStdoutLineHandler(_ handler: (@Sendable (String) -> Void)?) {
+        receiveLock.lock()
+        stdoutLineSink = handler
         receiveLock.unlock()
     }
 
@@ -1182,6 +1198,15 @@ public actor Client {
                 logger.warning("Failed to parse message: \(error.localizedDescription)")
             }
         }
+    }
+
+    /// A run of stdout bytes the framer set aside, on the reader's queue —
+    /// to the installed handler, or nowhere.
+    nonisolated private func receiveStdoutLine(_ line: String) {
+        receiveLock.lock()
+        let sink = stdoutLineSink
+        receiveLock.unlock()
+        sink?(line)
     }
 
     /// Counts the notification, then hands it to the installed handler —
