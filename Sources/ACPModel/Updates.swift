@@ -100,7 +100,7 @@ public struct SubagentSessionCapabilities: Codable, Sendable {
 /// A subagent's terminal state as the draft names it — and any other word
 /// the wire carries, kept as it came, so a newer adapter's word refuses no
 /// frame.
-public enum SubagentState: Codable, Sendable, Equatable {
+public enum SubagentSessionState: Codable, Sendable, Equatable {
     case completed
     case failed
     case cancelled
@@ -179,10 +179,10 @@ public struct SubagentSpawned: Codable, Sendable {
 /// `subagent_state_update`: a subagent's session reaching a terminal state.
 public struct SubagentStateUpdate: Codable, Sendable {
     public let subagentSessionId: SessionId
-    public let state: SubagentState
+    public let state: SubagentSessionState
     public let _meta: [String: AnyCodable]?
 
-    public init(subagentSessionId: SessionId, state: SubagentState, _meta: [String: AnyCodable]? = nil) {
+    public init(subagentSessionId: SessionId, state: SubagentSessionState, _meta: [String: AnyCodable]? = nil) {
         self.subagentSessionId = subagentSessionId
         self.state = state
         self._meta = _meta
