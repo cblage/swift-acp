@@ -1,0 +1,15 @@
+{
+  "originHash" : "a2d474636b0765e4520a1bc737caff9d259ab50bf101cd7e9a25f4af252f9be3",
+  "pins" : [
+    {
+      "identity" : "swift-yyjson",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/mattt/swift-yyjson.git",
+      "state" : {
+        "revision" : "ecccc733f4817f483f79db348f34237c39a6bcce",
+        "version" : "0.6.0"
+      }
+    }
+  ],
+  "version" : 3
+}
