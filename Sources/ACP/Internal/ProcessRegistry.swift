@@ -36,12 +36,17 @@ public actor ProcessRegistry {
         public let pgid: Int32?
         public let agentPath: String
         public let startedAt: TimeInterval
+        /// The client process that recorded the entry. An agent whose
+        /// client still runs is that client's own, never an orphan the
+        /// cleanup may end: two clients on one machine read one file.
+        public let ownerPid: Int32?
 
-        public init(pid: Int32, pgid: Int32?, agentPath: String, startedAt: TimeInterval) {
+        public init(pid: Int32, pgid: Int32?, agentPath: String, startedAt: TimeInterval, ownerPid: Int32? = nil) {
             self.pid = pid
             self.pgid = pgid
             self.agentPath = agentPath
             self.startedAt = startedAt
+            self.ownerPid = ownerPid
         }
     }
 
@@ -70,7 +75,10 @@ public actor ProcessRegistry {
     public func recordProcess(pid: Int32, pgid: Int32?, agentPath: String) {
         var entries = loadEntries()
         entries.removeAll { $0.pid == pid || ($0.pgid != nil && $0.pgid == pgid) }
-        entries.append(Entry(pid: pid, pgid: pgid, agentPath: agentPath, startedAt: Date().timeIntervalSince1970))
+        entries.append(
+            Entry(
+                pid: pid, pgid: pgid, agentPath: agentPath, startedAt: Date().timeIntervalSince1970,
+                ownerPid: getpid()))
         writeEntries(entries)
     }
 
@@ -85,17 +93,17 @@ public actor ProcessRegistry {
         writeEntries(entries)
     }
 
+    /// Ends every agent whose client is gone. An entry whose recording
+    /// client still runs is skipped without a look at its process, so a
+    /// client may run this beside its own launches and beside another
+    /// client on the same machine; the load has already dropped every
+    /// entry whose process is gone or past the age.
     public func cleanupOrphanedProcesses() async {
         let entries = loadEntries()
         guard !entries.isEmpty else { return }
 
-        let now = Date().timeIntervalSince1970
-        var remaining: [Entry] = []
-
         for entry in entries {
-            if now - entry.startedAt > maxEntryAge {
-                continue
-            }
+            guard isOrphan(entry) else { continue }
 
             let processes = fetchProcesses(for: entry)
             if processes.isEmpty {
@@ -104,7 +112,6 @@ public actor ProcessRegistry {
 
             guard matchesExpectedProcess(entry: entry, processes: processes) else {
                 logger.info("Skipping orphan cleanup for pid=\(entry.pid) pgid=\(entry.pgid ?? -1): command mismatch")
-                remaining.append(entry)
                 continue
             }
 
@@ -122,21 +129,39 @@ public actor ProcessRegistry {
                 } else {
                     _ = kill(targetId, SIGKILL)
                 }
-                let killed = await waitForExit(entry: entry, timeout: 1.0)
-                if !killed {
-                    remaining.append(entry)
-                }
+                _ = await waitForExit(entry: entry, timeout: 1.0)
             }
         }
 
-        writeEntries(remaining)
+        // The file is reloaded, never the snapshot above written back: a
+        // launch recorded while an orphan was waited on would vanish under
+        // it, and the load drops what the signals ended.
+        writeEntries(loadEntries())
     }
 
     // MARK: - Private helpers
 
+    /// The live entries: one whose process is gone or whose age is past
+    /// `maxEntryAge` is dropped at every load, so the file holds the
+    /// agents that run and each record and removal rewrites a few dozen
+    /// entries. A client that never runs the cleanup otherwise rewrites
+    /// its whole launch history — ten thousand entries, a megabyte —
+    /// at every launch and every termination, serialised on this queue.
     private func loadEntries() -> [Entry] {
         guard let data = try? Data(contentsOf: registryURL) else { return [] }
-        return (try? ACPJSONDecoder().decode([Entry].self, from: data)) ?? []
+        let entries = (try? ACPJSONDecoder().decode([Entry].self, from: data)) ?? []
+        let now = Date().timeIntervalSince1970
+        return entries.filter { now - $0.startedAt <= maxEntryAge && isAlive(entry: $0) }
+    }
+
+    /// True when the entry's recording client is gone — or unknown, an
+    /// entry written before clients were recorded. A client's own entries
+    /// and a running client's are never orphans.
+    private func isOrphan(_ entry: Entry) -> Bool {
+        guard let owner = entry.ownerPid else { return true }
+        if owner == getpid() { return false }
+        if kill(owner, 0) == 0 { return false }
+        return errno != EPERM
     }
 
     private func writeEntries(_ entries: [Entry]) {

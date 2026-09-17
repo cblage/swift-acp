@@ -81,6 +81,66 @@ final class ActorQueueTests: XCTestCase {
         let removed = try JSONDecoder().decode([ProcessRegistry.Entry].self, from: Data(contentsOf: file))
         XCTAssertEqual(removed, [])
     }
+
+    /// A `sleep` the test owns, running for its length or already exited.
+    private func spawnSleep(_ seconds: String) throws -> Process {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        process.arguments = [seconds]
+        try process.run()
+        return process
+    }
+
+    /// The file holds the agents that run: an entry whose process exited
+    /// and one older than the age go at the next load, whoever wrote them,
+    /// and a record carries the recording process.
+    func testTheRegistryKeepsLiveEntriesOnlyAndStampsTheRecordingProcess() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("acp-processes.json")
+        let exited = try spawnSleep("0")
+        exited.waitUntilExit()
+        let running = try spawnSleep("30")
+        defer { running.terminate() }
+        let now = Date().timeIntervalSince1970
+        let written = [
+            ProcessRegistry.Entry(pid: exited.processIdentifier, pgid: nil, agentPath: "/bin/sleep", startedAt: now),
+            ProcessRegistry.Entry(pid: getpid(), pgid: nil, agentPath: "/bin/sleep", startedAt: now - 8 * 24 * 60 * 60),
+            ProcessRegistry.Entry(pid: getpid(), pgid: nil, agentPath: "/bin/sleep", startedAt: now),
+        ]
+        try JSONEncoder().encode(written).write(to: file)
+
+        let registry = ProcessRegistry(registryDirectory: directory)
+        await registry.recordProcess(pid: running.processIdentifier, pgid: nil, agentPath: "/bin/sleep")
+        let kept = try JSONDecoder().decode([ProcessRegistry.Entry].self, from: Data(contentsOf: file))
+        XCTAssertEqual(kept.map(\.pid), [getpid(), running.processIdentifier])
+        XCTAssertEqual(kept.map(\.ownerPid), [nil, getpid()])
+    }
+
+    /// The cleanup ends an agent whose client is gone and leaves a running
+    /// client's agent alone, without a look at its process.
+    func testTheCleanupEndsAnOrphanAndKeepsARunningClientsAgent() async throws {
+        let directory = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("acp-processes.json")
+        let orphan = try spawnSleep("30")
+        let owned = try spawnSleep("30")
+        defer { owned.terminate() }
+        let now = Date().timeIntervalSince1970
+        let written = [
+            ProcessRegistry.Entry(pid: orphan.processIdentifier, pgid: nil, agentPath: "/bin/sleep", startedAt: now),
+            ProcessRegistry.Entry(
+                pid: owned.processIdentifier, pgid: nil, agentPath: "/bin/sleep", startedAt: now, ownerPid: getpid()),
+        ]
+        try JSONEncoder().encode(written).write(to: file)
+
+        let registry = ProcessRegistry(registryDirectory: directory)
+        await registry.cleanupOrphanedProcesses()
+        XCTAssertFalse(orphan.isRunning)
+        XCTAssertTrue(owned.isRunning)
+        let kept = try JSONDecoder().decode([ProcessRegistry.Entry].self, from: Data(contentsOf: file))
+        XCTAssertEqual(kept.map(\.pid), [owned.processIdentifier])
+    }
     #endif
 
     func testAnAgentRequestAndARoutedNotificationEnterTheActorFromTheReadQueue() async throws {
