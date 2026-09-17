@@ -18,6 +18,19 @@ public actor ProcessRegistry {
     private let registryURL: URL
     private let maxEntryAge: TimeInterval = 60 * 60 * 24 * 7 // 7 days
 
+    /// The registry's own queue, this actor's executor, like the process
+    /// manager's: every launch records itself here and every termination
+    /// removes itself, a file read and written each time, and a default
+    /// actor runs that on whatever executor the calling task prefers, at
+    /// the caller's priority — a burst of launches from background tasks
+    /// serialises every launch and every termination in the process
+    /// behind a starved registry. At `.utility`, above the callers' band.
+    private let executionQueue: DispatchSerialQueue
+
+    public nonisolated var unownedExecutor: UnownedSerialExecutor {
+        executionQueue.asUnownedSerialExecutor()
+    }
+
     public struct Entry: Codable, Equatable, Sendable {
         public let pid: Int32
         public let pgid: Int32?
@@ -33,7 +46,11 @@ public actor ProcessRegistry {
     }
 
     /// Initialize with custom registry directory
-    public init(registryDirectory: URL? = nil) {
+    public init(
+        registryDirectory: URL? = nil,
+        executor: DispatchSerialQueue = DispatchSerialQueue(label: "org.acp.registry", qos: .utility)
+    ) {
+        executionQueue = executor
         let directory: URL
         if let registryDirectory = registryDirectory {
             directory = registryDirectory

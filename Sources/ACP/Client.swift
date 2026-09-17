@@ -1154,8 +1154,13 @@ public actor Client {
     /// leaves this thread. The path this replaces awaited this actor per
     /// message, yielded to a stream a consumer task resumed on, and hopped
     /// onto the router's actor for every notification, a check that
-    /// returns for all but two methods. Responses and agent requests still
-    /// hop to the actor, one task each; both are rare by nature. The frame
+    /// returns for all but two methods. Responses and agent requests enter
+    /// the actor THROUGH ITS OWN QUEUE, a block on `executionQueue` that
+    /// assumes the isolation: a response is handled in the block, and an
+    /// agent request — like a routed notification — starts its task inside
+    /// the actor, so its first job lands on the queue. A task made on the
+    /// reader's thread instead would start on the cooperative pool and
+    /// hop from there, a pool thread taken per frame. The frame
     /// arrives with the HEADER its framer read — `method`, and whether an
     /// `id` holds a value — so a notification is classified without a
     /// decode of its own.
@@ -1203,8 +1208,11 @@ public actor Client {
 
             switch message {
             case .response(let response):
-                Task { [weak self] in
-                    await self?.handleResponse(response)
+                executionQueue.async { [weak self] in
+                    guard let self else { return }
+                    self.assumeIsolated { client in
+                        client.handleResponse(response)
+                    }
                 }
 
             case .notification(var notification):
@@ -1214,8 +1222,11 @@ public actor Client {
                 deliver(notification)
 
             case .request(let request):
-                Task { [weak self] in
-                    await self?.handleIncomingRequest(request)
+                executionQueue.async { [weak self] in
+                    guard let self else { return }
+                    self.assumeIsolated { client in
+                        Task { await client.handleIncomingRequest(request) }
+                    }
                 }
             }
         } catch {
@@ -1251,13 +1262,16 @@ public actor Client {
             notificationContinuation.yield(notification)
         }
         if Self.routedNotificationMethods.contains(notification.method) {
-            Task { [weak self] in
-                await self?.handleIncomingNotification(notification)
+            executionQueue.async { [weak self] in
+                guard let self else { return }
+                self.assumeIsolated { client in
+                    Task { await client.handleIncomingNotification(notification) }
+                }
             }
         }
     }
 
-    private func handleResponse(_ response: JSONRPCResponse) async {
+    private func handleResponse(_ response: JSONRPCResponse) {
         if let continuation = pendingRequests.removeValue(forKey: response.id) {
             expectedRequestIds.remove(response.id)
             pendingTimeouts.removeValue(forKey: response.id)?.cancel()

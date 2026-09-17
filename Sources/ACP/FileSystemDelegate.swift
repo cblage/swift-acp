@@ -14,9 +14,22 @@ public actor FileSystemDelegate {
 
     private let logger = Logger.forCategory("FileSystemDelegate")
 
+    /// The delegate's own queue, this actor's executor, like the terminal
+    /// delegate's: a read and a write here are blocking file calls, and a
+    /// default actor runs them on the cooperative pool, holding one of its
+    /// few threads for the call's whole length. At `.utility`, an agent's
+    /// file request answered without waiting on the background band.
+    private let executionQueue: DispatchSerialQueue
+
+    public nonisolated var unownedExecutor: UnownedSerialExecutor {
+        executionQueue.asUnownedSerialExecutor()
+    }
+
     // MARK: - Initialization
 
-    public init() {}
+    public init(executor: DispatchSerialQueue = DispatchSerialQueue(label: "org.acp.filesystem", qos: .utility)) {
+        executionQueue = executor
+    }
 
     // MARK: - File Operations
 
