@@ -712,6 +712,52 @@ final class ACPE2ETests: XCTestCase {
         await client.terminate()
     }
 
+    func testAnUnreadStderrStreamKeepsOnlyItsNewestLines() async throws {
+        let limit = ACPProcessManager.stderrLineBufferLimit
+        let total = limit + 44
+        // The sleep leaves time to take the stream before the agent exits,
+        // which withdraws it.
+        try createMockAgent(script: """
+        sleep 0.3
+        i=1
+        while [ $i -le \(total) ]; do
+          echo "line $i" >&2
+          i=$((i+1))
+        done
+        """)
+
+        let client = Client()
+        try await client.launch(agentPath: mockAgentPath)
+
+        guard let stderrLines = await client.stderrLines() else {
+            XCTFail("Expected stderr stream after launch")
+            await client.terminate()
+            return
+        }
+
+        // NOBODY READS WHILE THE AGENT WRITES: the stream is withdrawn once
+        // the exit has been handled, every line yielded and the stream
+        // finished by then, so what is read below is what it kept. A stream
+        // still standing at the bound is finished by the terminate, so the
+        // read can never wait on a line that is not coming.
+        let deadline = Date().addingTimeInterval(10)
+        while await client.stderrLines() != nil, Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        if await client.stderrLines() != nil {
+            XCTFail("The agent's exit was never handled")
+            await client.terminate()
+        }
+
+        var kept: [String] = []
+        for await line in stderrLines {
+            kept.append(line)
+        }
+        XCTAssertEqual(kept.count, limit)
+        XCTAssertEqual(kept.first, "line \(total - limit + 1)")
+        XCTAssertEqual(kept.last, "line \(total)")
+    }
+
     func testClientExposesProcessIdentifiersOnlyWhileRunning() async throws {
         try createMockAgent(script: """
         trap 'exit 0' TERM

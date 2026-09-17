@@ -63,6 +63,14 @@ actor ACPProcessManager {
         executionQueue.asUnownedSerialExecutor()
     }
 
+    /// THE STDERR LINE STREAM KEEPS ITS NEWEST LINES AND NO MORE: every line
+    /// the agent writes is yielded whether or not the client ever asks for
+    /// the stream, and an unbounded buffer holds them all for the process's
+    /// life — hours of an agent's log, in a client that reads no stderr. A
+    /// client reading as the lines arrive loses nothing; one that starts
+    /// late, or never reads, holds at most this many.
+    static let stderrLineBufferLimit = 256
+
     private var stderrLineContinuation: AsyncStream<String>.Continuation?
     private var stderrLineStream: AsyncStream<String>?
 
@@ -106,7 +114,9 @@ actor ACPProcessManager {
         try? stderr.fileHandleForWriting.close()
 
         var stderrContinuation: AsyncStream<String>.Continuation!
-        stderrLineStream = AsyncStream { stderrContinuation = $0 }
+        stderrLineStream = AsyncStream(
+            bufferingPolicy: .bufferingNewest(Self.stderrLineBufferLimit)
+        ) { stderrContinuation = $0 }
         stderrLineContinuation = stderrContinuation
         let lines = stderrContinuation!
 
@@ -239,7 +249,9 @@ actor ACPProcessManager {
         }
 
         var stderrContinuation: AsyncStream<String>.Continuation!
-        stderrLineStream = AsyncStream { stderrContinuation = $0 }
+        stderrLineStream = AsyncStream(
+            bufferingPolicy: .bufferingNewest(Self.stderrLineBufferLimit)
+        ) { stderrContinuation = $0 }
         stderrLineContinuation = stderrContinuation
         let lines = stderrContinuation!
 
