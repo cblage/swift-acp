@@ -1225,7 +1225,7 @@ public actor Client {
                 executionQueue.async { [weak self] in
                     guard let self else { return }
                     self.assumeIsolated { client in
-                        Task { await client.handleIncomingRequest(request) }
+                        _ = Task { await client.handleIncomingRequest(request) }
                     }
                 }
             }
@@ -1265,7 +1265,7 @@ public actor Client {
             executionQueue.async { [weak self] in
                 guard let self else { return }
                 self.assumeIsolated { client in
-                    Task { await client.handleIncomingNotification(notification) }
+                    _ = Task { await client.handleIncomingNotification(notification) }
                 }
             }
         }
