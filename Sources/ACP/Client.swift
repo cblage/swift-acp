@@ -267,6 +267,14 @@ public actor Client {
         await processManager.stderrLines()
     }
 
+    /// THE LAUNCHED AGENT'S EXIT, once its process has ended: its status and
+    /// the newest of what it wrote on stderr — set before the closed sink
+    /// fires, for the consumer's words on the end. Nil while it runs, and
+    /// for an attached agent.
+    nonisolated public var lastExit: AgentExit? {
+        processManager.lastExit
+    }
+
     public func setDelegate(_ delegate: ClientDelegate?) {
         self.delegate = delegate
         Task {

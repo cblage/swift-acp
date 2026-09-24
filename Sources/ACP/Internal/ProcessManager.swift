@@ -16,10 +16,8 @@ actor ACPProcessManager {
 
     private var process: ACPSpawnedProcess?
     private var processGroupId: pid_t?
-    private var stdinPipe: Pipe?
     private var stdoutPipe: Pipe?
     private var stderrPipe: Pipe?
-    private var stdinDescriptor: Int32 = -1
     /// The running process's stdout and stderr, read and framed on the
     /// reader's own serial queue — see `ACPOutputReader`.
     private var reader: ACPOutputReader?
@@ -27,7 +25,6 @@ actor ACPProcessManager {
     /// file handles the caller owns, read and written exactly as a spawned
     /// agent's pipes are, its end the read end's EOF.
     private var attached = false
-    private var attachedStdin: FileHandle?
 
     private let logger: Logger
 
@@ -38,23 +35,25 @@ actor ACPProcessManager {
     nonisolated(unsafe) private var onMessage: (@Sendable (Data, ACPFrameHeader) -> Void)?
     nonisolated(unsafe) private var onStdoutLine: (@Sendable (String) -> Void)?
     nonisolated(unsafe) private var onTermination: (@Sendable (Int32) async -> Void)?
+    /// STDOUT AS THE AGENT WROTE IT, for a client with a wire of its own
+    /// (`AgentProcess`): set, every chunk goes here in order, unframed, in
+    /// place of `onMessage` and `onStdoutLine`.
+    nonisolated(unsafe) private var onStdoutChunk: (@Sendable (Data) -> Void)?
 
-    /// Stdin writes run HERE, never on the actor: a write to a full pipe
-    /// blocks until the agent reads, and an agent busy emitting a replay
-    /// may not read for tens of seconds. On the actor that blocked
-    /// `processOutput` too, so stdout went unprocessed for exactly as long
-    /// — a 2026-09-03 profile showed model and effort requests parked
-    /// 14–32s in the write while the reader waited on the actor and the
-    /// transcript stalled. A serial queue keeps the writes ordered.
+    /// What outlives the actor's own turns, read from anywhere under this
+    /// lock: the stdin writer, the newest of stderr, and the last exit.
+    private let stateLock = NSLock()
+    nonisolated(unsafe) private var stdinWriter: ACPStdinWriter?
+    nonisolated(unsafe) private var stderrTailBytes = Data()
+    nonisolated(unsafe) private var exitRecord: AgentExit?
+
     /// THE INTAKE'S QoS COMES FROM THE APP at the client's construction
-    /// (2026-09-06): the library bakes no band into its queues. This queue
-    /// and the reader's are created at `qos`, and when one is given every
-    /// write and every read handler ENFORCES it, so neither inherits the
-    /// band its submitter happened to carry; `.unspecified` leaves plain
-    /// queues and plain handlers.
+    /// (2026-09-06): the library bakes no band into its queues. The stdin
+    /// writer's queue and the reader's are created at `qos`, and when one
+    /// is given every write and every read handler ENFORCES it, so neither
+    /// inherits the band its submitter happened to carry; `.unspecified`
+    /// leaves plain queues and plain handlers.
     private let qos: DispatchQoS
-    private let enforced: DispatchWorkItemFlags
-    private let writeQueue: DispatchQueue
 
     /// The connection's queue, this actor's executor — see `Client`.
     private let executionQueue: DispatchSerialQueue
@@ -71,6 +70,10 @@ actor ACPProcessManager {
     /// late, or never reads, holds at most this many.
     static let stderrLineBufferLimit = 256
 
+    /// THE NEWEST OF STDERR, kept for an exit's words whether or not anyone
+    /// reads the line stream: the bytes of its newest lines, and no more.
+    static let stderrTailLimit = 64 * 1024
+
     private var stderrLineContinuation: AsyncStream<String>.Continuation?
     private var stderrLineStream: AsyncStream<String>?
 
@@ -86,8 +89,6 @@ actor ACPProcessManager {
         self.executionQueue = executor
         self.logger = Logger.forCategory("ACPProcessManager")
         self.qos = qos
-        self.enforced = qos == .unspecified ? [] : [.enforceQoS]
-        self.writeQueue = DispatchQueue(label: "org.acp.process.stdin", qos: qos)
     }
 
     // MARK: - Process Lifecycle
@@ -106,32 +107,13 @@ actor ACPProcessManager {
             throw ClientError.invalidResponse
         }
         attached = true
-        attachedStdin = stdin
-        stdinDescriptor = stdin.fileDescriptor
+        stateLock.withLock { stdinWriter = ACPStdinWriter(stdin, qos: qos) }
         // No stderr to read: a pipe whose write end is closed at once, so
         // the reader's stderr source meets EOF and cancels itself.
         let stderr = Pipe()
         try? stderr.fileHandleForWriting.close()
-
-        var stderrContinuation: AsyncStream<String>.Continuation!
-        stderrLineStream = AsyncStream(
-            bufferingPolicy: .bufferingNewest(Self.stderrLineBufferLimit)
-        ) { stderrContinuation = $0 }
-        stderrLineContinuation = stderrContinuation
-        let lines = stderrContinuation!
-
-        handlerLock.lock()
-        let onMessage = self.onMessage
-        let onStdoutLine = self.onStdoutLine
-        handlerLock.unlock()
-        let reader = ACPOutputReader(
-            stdout: stdout,
-            stderr: stderr.fileHandleForReading,
-            logger: logger,
-            qos: qos,
-            onMessage: { data, header in onMessage?(data, header) },
-            onStdoutLine: { line in onStdoutLine?(line) },
-            onStderrLine: { line in lines.yield(line) },
+        let reader = makeReader(
+            stdout: stdout, stderr: stderr.fileHandleForReading,
             onStdoutEnd: { [weak self] in
                 Task {
                     await self?.handleTermination(exitCode: 0)
@@ -140,6 +122,66 @@ actor ACPProcessManager {
         )
         self.reader = reader
         reader.start()
+    }
+
+    /// The reader over the agent's two outputs, with a fresh stderr line
+    /// stream: stdout framed for the client's handlers, or handed on raw
+    /// where a raw handler is installed; every stderr line to the stream
+    /// and to the tail.
+    private func makeReader(
+        stdout: FileHandle, stderr: FileHandle, onStdoutEnd: (@Sendable () -> Void)? = nil
+    ) -> ACPOutputReader {
+        var stderrContinuation: AsyncStream<String>.Continuation!
+        stderrLineStream = AsyncStream(
+            bufferingPolicy: .bufferingNewest(Self.stderrLineBufferLimit)
+        ) { stderrContinuation = $0 }
+        stderrLineContinuation = stderrContinuation
+        let lines = stderrContinuation!
+        stateLock.withLock {
+            stderrTailBytes.removeAll()
+            exitRecord = nil
+        }
+
+        handlerLock.lock()
+        let onMessage = self.onMessage
+        let onStdoutLine = self.onStdoutLine
+        let onStdoutChunk = self.onStdoutChunk
+        handlerLock.unlock()
+        return ACPOutputReader(
+            stdout: stdout,
+            stderr: stderr,
+            logger: logger,
+            qos: qos,
+            onMessage: { data, header in onMessage?(data, header) },
+            onStdoutLine: { line in onStdoutLine?(line) },
+            onStderrLine: { [weak self] line in
+                lines.yield(line)
+                self?.keepStderrLine(line)
+            },
+            onStdoutEnd: onStdoutEnd,
+            onStdoutChunk: onStdoutChunk
+        )
+    }
+
+    /// A stderr line into the tail, the oldest bytes dropped past its limit.
+    nonisolated private func keepStderrLine(_ line: String) {
+        stateLock.withLock {
+            stderrTailBytes.append(contentsOf: Array(line.utf8) + [0x0A])
+            if stderrTailBytes.count > Self.stderrTailLimit {
+                stderrTailBytes.removeFirst(stderrTailBytes.count - Self.stderrTailLimit)
+            }
+        }
+    }
+
+    /// The newest of what the agent wrote on stderr.
+    nonisolated var stderrTail: String {
+        String(decoding: stateLock.withLock { stderrTailBytes }, as: UTF8.self)
+    }
+
+    /// The spawned agent's exit, once it has ended: its status and the
+    /// newest of its stderr. Nil while it runs and for an attached agent.
+    nonisolated var lastExit: AgentExit? {
+        stateLock.withLock { exitRecord }
     }
 
     func launch(agentPath: String, arguments: [String] = [], workingDirectory: String? = nil, environment customEnvironment: [String: String]? = nil) throws {
@@ -231,11 +273,15 @@ actor ACPProcessManager {
         try? stdout.fileHandleForWriting.close()
         try? stderr.fileHandleForWriting.close()
 
-        stdinPipe = stdin
         stdoutPipe = stdout
         stderrPipe = stderr
 
-        stdinDescriptor = stdin.fileHandleForWriting.fileDescriptor
+        stateLock.withLock { stdinWriter = ACPStdinWriter(stdin.fileHandleForWriting, qos: qos) }
+        // The reader before the process's exit can be reported: the exit's
+        // handling drains the reader first.
+        let reader = makeReader(
+            stdout: stdout.fileHandleForReading, stderr: stderr.fileHandleForReading)
+        self.reader = reader
         process = ACPSpawnedProcess(pid: pid) { [weak self] exitCode in
             Task {
                 await self?.handleTermination(exitCode: exitCode)
@@ -247,28 +293,6 @@ actor ACPProcessManager {
         Task {
             await ProcessRegistry.shared.recordProcess(pid: pid, pgid: pid, agentPath: actualPath)
         }
-
-        var stderrContinuation: AsyncStream<String>.Continuation!
-        stderrLineStream = AsyncStream(
-            bufferingPolicy: .bufferingNewest(Self.stderrLineBufferLimit)
-        ) { stderrContinuation = $0 }
-        stderrLineContinuation = stderrContinuation
-        let lines = stderrContinuation!
-
-        handlerLock.lock()
-        let onMessage = self.onMessage
-        let onStdoutLine = self.onStdoutLine
-        handlerLock.unlock()
-        let reader = ACPOutputReader(
-            stdout: stdout.fileHandleForReading,
-            stderr: stderr.fileHandleForReading,
-            logger: logger,
-            qos: qos,
-            onMessage: { data, header in onMessage?(data, header) },
-            onStdoutLine: { line in onStdoutLine?(line) },
-            onStderrLine: { line in lines.yield(line) }
-        )
-        self.reader = reader
         reader.start()
     }
 
@@ -293,13 +317,20 @@ actor ACPProcessManager {
         return stderrLineStream
     }
 
-    func terminate() async {
+    /// THE ONE END POLICY, every agent's: stdin closed behind the writes
+    /// before it; the reader stopped, discarding what the agent was still
+    /// saying; then, past `grace` for the agent's own end at its stdin's
+    /// close — none by default — SIGTERM to its group, then SIGKILL to it
+    /// two seconds on. A LEADER THAT ENDS ON ITS OWN STILL TAKES ITS GROUP:
+    /// a program the agent started runs in the agent's group and outlives
+    /// it, so the group takes a SIGTERM even where the agent ended within
+    /// the grace. Returns once the process has exited or the kill is sent.
+    func terminate(grace: TimeInterval = 0) async {
+        stateLock.withLock { stdinWriter }?.close()
+        stateLock.withLock { stdinWriter = nil }
         if attached {
             // The attached agent's end: its stdin closed, the reader
             // stopped without draining, nothing to signal.
-            stdinDescriptor = -1
-            try? attachedStdin?.close()
-            attachedStdin = nil
             if let reader {
                 await reader.stop()
                 self.reader = nil
@@ -314,9 +345,6 @@ actor ACPProcessManager {
         let pgid = processGroupId
         let pid = proc?.pid
 
-        stdinDescriptor = -1
-        try? stdinPipe?.fileHandleForWriting.close()
-
         // A terminate discards what the agent was still saying: the reader
         // stops without draining, and its sources close the read ends on
         // their own queue once they have cancelled — never here, since
@@ -329,31 +357,30 @@ actor ACPProcessManager {
         stderrLineContinuation = nil
         stderrLineStream = nil
 
-        if let proc, proc.isRunning {
-            if let pgid {
-                _ = killpg(pgid, SIGTERM)
-            } else {
-                _ = kill(proc.pid, SIGTERM)
-            }
-        }
-
         if let proc {
-            let exited = await waitForExit(proc, timeout: 2.0)
-            if !exited, proc.pid > 0 {
-                if let pgid {
-                    _ = killpg(pgid, SIGKILL)
-                } else {
-                    _ = kill(proc.pid, SIGKILL)
-                }
+            let exited = grace > 0 ? await proc.waitForExit(within: grace) : !proc.isRunning
+            Self.signal(SIGTERM, group: pgid, pid: proc.pid)
+            if !exited, !(await proc.waitForExit(within: 2.0)) {
+                Self.signal(SIGKILL, group: pgid, pid: proc.pid)
+                _ = await proc.waitForExit(within: 2.0)
             }
         }
         await ProcessRegistry.shared.removeProcess(pid: pid, pgid: pgid)
         process = nil
         processGroupId = nil
 
-        stdinPipe = nil
         stdoutPipe = nil
         stderrPipe = nil
+    }
+
+    /// A signal to the agent's group, or to the agent alone where it leads
+    /// none.
+    private static func signal(_ signal: Int32, group: pid_t?, pid: pid_t) {
+        if let group {
+            _ = killpg(group, signal)
+        } else if pid > 0 {
+            _ = kill(pid, signal)
+        }
     }
 
     // MARK: - I/O Operations
@@ -362,45 +389,33 @@ actor ACPProcessManager {
     /// actor, encoded by the caller on its own: a generic `Encodable`
     /// value is not `Sendable`, and the client encodes once anyway.
     func writeMessage(_ data: Data) async throws {
-        let fd = stdinDescriptor
-        guard fd >= 0, process?.isRunning == true || attached else {
+        guard let writer = stateLock.withLock({ stdinWriter }),
+            process?.isRunning == true || attached
+        else {
             throw ClientError.processNotRunning
         }
-
         let lineData = data + Data([0x0A])
-
-        // Only the descriptor crosses to the queue: the write loop is POSIX
-        // so the closure captures nothing but Sendable values, and a
-        // handle closed under a blocked write surfaces as an error here
-        // instead of a hang.
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            // The app's band, enforced when one was given: the write holds
-            // the intake's QoS whatever the submitter's.
-            writeQueue.async(qos: qos, flags: enforced) {
-                // A raw write to a pipe whose reader has died raises SIGPIPE
-                // for the whole process; the descriptor opts out so a dead
-                // agent reads as EPIPE, the error path, not a kill.
-                _ = fcntl(fd, F_SETNOSIGPIPE, 1)
-                let failure: Int32 = lineData.withUnsafeBytes { raw in
-                    guard let base = raw.baseAddress else { return 0 }
-                    var offset = 0
-                    while offset < raw.count {
-                        let written = Darwin.write(fd, base + offset, raw.count - offset)
-                        if written < 0 {
-                            if errno == EINTR { continue }
-                            return errno
-                        }
-                        offset += written
-                    }
-                    return 0
-                }
-                if failure == 0 {
-                    continuation.resume()
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, Error>) in
+            writer.write(lineData) { error in
+                if let error {
+                    continuation.resume(throwing: error)
                 } else {
-                    continuation.resume(throwing: ClientError.transportError("stdin write failed: \(String(cString: strerror(failure)))"))
+                    continuation.resume()
                 }
             }
         }
+    }
+
+    /// The bytes as they are to stdin, after every write before them, from
+    /// any thread and never awaited — for a client with a wire of its own
+    /// (`AgentProcess`).
+    nonisolated func write(_ data: Data, completion: @escaping @Sendable (Error?) -> Void) {
+        guard let writer = stateLock.withLock({ stdinWriter }) else {
+            completion(ClientError.processNotRunning)
+            return
+        }
+        writer.write(data, completion: completion)
     }
 
     // MARK: - Callbacks
@@ -426,6 +441,20 @@ actor ACPProcessManager {
         handlerLock.unlock()
     }
 
+    /// The raw handlers, for a client with a wire of its own: every chunk
+    /// of stdout to `onStdout` on the reader's queue, in order and
+    /// unframed, and the exit's status to `onTermination` after the last
+    /// chunk — installed before the launch.
+    nonisolated func setRawHandlers(
+        onStdout: @escaping @Sendable (Data) -> Void,
+        onTermination: @escaping @Sendable (Int32) async -> Void
+    ) {
+        handlerLock.lock()
+        self.onStdoutChunk = onStdout
+        self.onTermination = onTermination
+        handlerLock.unlock()
+    }
+
     // MARK: - Private Methods
 
     private func handleTermination(exitCode: Int32) async {
@@ -445,12 +474,9 @@ actor ACPProcessManager {
         stderrLineContinuation = nil
         stderrLineStream = nil
 
-        stdinDescriptor = -1
-        try? stdinPipe?.fileHandleForWriting.close()
-        try? attachedStdin?.close()
-        attachedStdin = nil
+        stateLock.withLock { stdinWriter }?.close()
+        stateLock.withLock { stdinWriter = nil }
         attached = false
-        stdinPipe = nil
         stdoutPipe = nil
         stderrPipe = nil
         process = nil
@@ -458,20 +484,17 @@ actor ACPProcessManager {
 
         logger.info("Agent process terminated with code: \(exitCode)")
         if !wasAttached {
+            // A LEADER THAT ENDS ON ITS OWN STILL TAKES ITS GROUP: what it
+            // started runs in its group and would outlive it.
+            if let pgid { _ = killpg(pgid, SIGTERM) }
+            let tail = stderrTail
+            stateLock.withLock { exitRecord = AgentExit(status: exitCode, stderrTail: tail) }
             await ProcessRegistry.shared.removeProcess(pid: pid, pgid: pgid)
         }
         // The scoped form: a bare lock/unlock pair is not allowed across
         // an async context, and nothing here awaits inside it.
         let onTermination = handlerLock.withLock { self.onTermination }
         await onTermination?(exitCode)
-    }
-
-    private func waitForExit(_ proc: ACPSpawnedProcess, timeout: TimeInterval) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        while proc.isRunning, Date() < deadline {
-            try? await Task.sleep(nanoseconds: 50_000_000)
-        }
-        return !proc.isRunning
     }
 
     /// THE SPAWN, `posix_spawn` with the child LEADING A PROCESS GROUP OF
@@ -539,12 +562,15 @@ actor ACPProcessManager {
 /// process group it leads, and its exit — observed by a process source that
 /// reaps it and hands the status on ONCE, on the source's own queue, as
 /// `Process.terminationStatus` would report it: the exit code of a process
-/// that exited, the number of the signal that ended one.
+/// that exited, the number of the signal that ended one. A wait for the
+/// exit is resumed by the reap itself, never a poll.
 final class ACPSpawnedProcess: @unchecked Sendable {
     let pid: pid_t
     private let lock = NSLock()
     private var exited = false
+    private var exitWaiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
     private var source: DispatchSourceProcess?
+    private let queue = DispatchQueue(label: "org.acp.process.exit")
 
     /// True until the exit has been reaped.
     var isRunning: Bool {
@@ -554,7 +580,7 @@ final class ACPSpawnedProcess: @unchecked Sendable {
     init(pid: pid_t, onExit: @escaping @Sendable (Int32) -> Void) {
         self.pid = pid
         let source = DispatchSource.makeProcessSource(
-            identifier: pid, eventMask: .exit, queue: DispatchQueue(label: "org.acp.process.exit")
+            identifier: pid, eventMask: .exit, queue: queue
         )
         self.source = source
         source.setEventHandler { [weak self] in
@@ -575,10 +601,107 @@ final class ACPSpawnedProcess: @unchecked Sendable {
         lock.lock()
         let first = !exited
         exited = true
+        let waiters = first ? Array(exitWaiters.values) : []
+        if first { exitWaiters.removeAll() }
         lock.unlock()
         guard first else { return }
         source?.cancel()
+        for waiter in waiters { waiter.resume(returning: true) }
         onExit(status)
+    }
+
+    /// True at the exit — at once where it is over — or false at `seconds`:
+    /// the reap resumes the wait, a deadline on the exit's queue the rest.
+    func waitForExit(within seconds: TimeInterval) async -> Bool {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            let id = UUID()
+            let done = lock.withLock { () -> Bool in
+                guard !exited else { return true }
+                exitWaiters[id] = continuation
+                return false
+            }
+            guard !done else {
+                continuation.resume(returning: true)
+                return
+            }
+            queue.asyncAfter(deadline: .now() + seconds) { [self] in
+                let (waiter, over) = lock.withLock {
+                    (exitWaiters.removeValue(forKey: id), exited)
+                }
+                waiter?.resume(returning: over)
+            }
+        }
+    }
+}
+
+/// THE AGENT'S STDIN, written on ONE serial queue in call order, its close
+/// queued behind the writes before it — the descriptor read on the queue,
+/// so no write ever meets a descriptor closed and reused under it. Writes
+/// run HERE, never on an actor: a write to a full pipe blocks until the
+/// agent reads, and an agent busy emitting a replay may not read for tens
+/// of seconds — on the process actor that blocked stdout's processing for
+/// exactly as long (a 2026-09-03 profile showed model and effort requests
+/// parked 14–32s in the write while the transcript stalled). A write the
+/// agent never reads ends with the agent: its death fails the write with
+/// EPIPE, never a signal, and the close queued behind it runs then.
+final class ACPStdinWriter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var handle: FileHandle?
+    private let queue: DispatchQueue
+    private let qos: DispatchQoS
+    private let enforced: DispatchWorkItemFlags
+
+    /// THE APP'S BAND, enforced when one was given: the write holds the
+    /// intake's QoS whatever the submitter's.
+    init(_ handle: FileHandle, qos: DispatchQoS) {
+        self.handle = handle
+        self.qos = qos
+        self.enforced = qos == .unspecified ? [] : [.enforceQoS]
+        self.queue = DispatchQueue(label: "org.acp.process.stdin", qos: qos)
+    }
+
+    /// The bytes as they are, after every write before them; `completion`
+    /// gets nil once written, or the failure.
+    func write(_ data: Data, completion: @escaping @Sendable (Error?) -> Void) {
+        queue.async(qos: qos, flags: enforced) { [self] in
+            guard let fd = lock.withLock({ handle?.fileDescriptor }), fd >= 0 else {
+                completion(ClientError.processNotRunning)
+                return
+            }
+            // A raw write to a pipe whose reader has died raises SIGPIPE for
+            // the whole process; the descriptor opts out so a dead agent
+            // reads as EPIPE, the error path, not a kill.
+            _ = fcntl(fd, F_SETNOSIGPIPE, 1)
+            let failure: Int32 = data.withUnsafeBytes { raw in
+                guard let base = raw.baseAddress else { return 0 }
+                var offset = 0
+                while offset < raw.count {
+                    let written = Darwin.write(fd, base + offset, raw.count - offset)
+                    if written < 0 {
+                        if errno == EINTR { continue }
+                        return errno
+                    }
+                    offset += written
+                }
+                return 0
+            }
+            completion(
+                failure == 0
+                    ? nil
+                    : ClientError.transportError(
+                        "stdin write failed: \(String(cString: strerror(failure)))"))
+        }
+    }
+
+    /// Stdin closed after every write before it — the agent's own end.
+    func close() {
+        queue.async(qos: qos, flags: enforced) { [self] in
+            let closing = lock.withLock { () -> FileHandle? in
+                defer { handle = nil }
+                return handle
+            }
+            try? closing?.close()
+        }
     }
 }
 
@@ -636,6 +759,9 @@ final class ACPOutputReader: @unchecked Sendable {
     /// Stdout's EOF, reported once — an attached agent's end, where a
     /// spawned agent's is its exit.
     private let onStdoutEnd: (@Sendable () -> Void)?
+    /// STDOUT UNFRAMED, where set: every chunk as it was read, in order,
+    /// for a client with a wire of its own — the framer then idle.
+    private let onStdoutChunk: (@Sendable (Data) -> Void)?
 
     // Confined to `queue` from here on.
     private var stdoutSource: DispatchSourceRead?
@@ -691,7 +817,8 @@ final class ACPOutputReader: @unchecked Sendable {
         onMessage: @escaping @Sendable (Data, ACPFrameHeader) -> Void,
         onStdoutLine: @escaping @Sendable (String) -> Void,
         onStderrLine: @escaping @Sendable (String) -> Void,
-        onStdoutEnd: (@Sendable () -> Void)? = nil
+        onStdoutEnd: (@Sendable () -> Void)? = nil,
+        onStdoutChunk: (@Sendable (Data) -> Void)? = nil
     ) {
         self.stdout = stdout
         self.stderr = stderr
@@ -703,6 +830,7 @@ final class ACPOutputReader: @unchecked Sendable {
         self.onStdoutLine = onStdoutLine
         self.onStderrLine = onStderrLine
         self.onStdoutEnd = onStdoutEnd
+        self.onStdoutChunk = onStdoutChunk
     }
 
     func start() {
@@ -806,6 +934,10 @@ final class ACPOutputReader: @unchecked Sendable {
     }
 
     private func receiveStdout(_ data: Data) {
+        if let onStdoutChunk {
+            onStdoutChunk(data)
+            return
+        }
         readBuffer.append(data)
         while let (message, header) = popNextMessage() {
             onMessage(message, header)

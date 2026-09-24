@@ -239,6 +239,27 @@ try await client.attach(reading: recording.fileHandleForReading, writing: answer
 
 The handler runs synchronously on the client's read queue and must not block; install it before `launch`.
 
+When the launched agent's process ends, its exit — the status, and the newest of what it wrote on stderr — is on the client before the closed sink fires, for the words a client shows on the end:
+
+```swift
+client.setNotificationHandler(handle, onClosed: {
+    if let exit = client.lastExit {
+        show("The agent exited (status \(exit.status)): \(exit.stderrTail.suffix(400))")
+    }
+})
+```
+
+An agent that speaks a wire of its own runs on the same process layer as `AgentProcess`: the same launch, process group, registry, stdin, stderr, and end, with its stdout handed on as the bytes it wrote, in order, for the caller to frame. Every process's end is one policy: stdin closed behind the writes before it, then — past a `grace` for the agent's own end at that close, none by default — SIGTERM to its group and SIGKILL two seconds on; and the group takes a SIGTERM whenever the agent ends, on its own or within the grace, so a program it started never outlives it.
+
+```swift
+let process = AgentProcess()
+try await process.launch(agentPath: path, arguments: ["--mode", "rpc"],
+                         onStdout: { chunk in framer.append(chunk) },
+                         onEnd: { status in connectionEnded(status) })
+process.write(line + Data([0x0A])) { error in /* nil once written */ }
+await process.terminate(grace: 2)
+```
+
 ### 8. Session Management
 
 ```swift
