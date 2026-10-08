@@ -71,4 +71,31 @@ final class ClientAttachTests: XCTestCase {
         await fulfillment(of: [closed], timeout: 5)
         await client.terminate()
     }
+
+    /// A delegate set on a connection already reading answers the request
+    /// the agent sends the moment `setDelegate` returns.
+    func testADelegateSetOnALiveConnectionAnswersTheNextRequest() async throws {
+        let agentOut = Pipe()
+        let agentIn = Pipe()
+        let client = Client()
+        try await client.attach(
+            reading: agentOut.fileHandleForReading, writing: agentIn.fileHandleForWriting)
+        let delegate = MockClientDelegate()
+        await client.setDelegate(delegate)
+
+        let responseLine = Task.detached { agentIn.fileHandleForReading.availableData }
+        let request =
+            #"{"jsonrpc":"2.0","id":3,"method":"fs/read_text_file","params":{"sessionId":"s","path":"/notes.txt"}}"#
+        agentOut.fileHandleForWriting.write(Data((request + "\n").utf8))
+        let response = await responseLine.value
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: response) as? [String: Any])
+        XCTAssertEqual(object["id"] as? Int, 3)
+        XCTAssertNil(object["error"])
+        let result = try XCTUnwrap(object["result"] as? [String: Any])
+        XCTAssertEqual(result["content"] as? String, "mock content")
+
+        try agentOut.fileHandleForWriting.close()
+        await client.terminate()
+        withExtendedLifetime(delegate) {}
+    }
 }

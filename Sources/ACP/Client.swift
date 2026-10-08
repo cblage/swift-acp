@@ -275,11 +275,12 @@ public actor Client {
         processManager.lastExit
     }
 
-    public func setDelegate(_ delegate: ClientDelegate?) {
+    /// Sets the delegate here and on the request router before it returns, so
+    /// a request the agent sends the moment after reaches this delegate —
+    /// never the previous one, nor `delegateNotSet` for want of one.
+    public func setDelegate(_ delegate: ClientDelegate?) async {
         self.delegate = delegate
-        Task {
-            await requestRouter.setDelegate(delegate)
-        }
+        await requestRouter.setDelegate(delegate)
     }
 
     public func launch(
