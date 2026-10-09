@@ -31,6 +31,41 @@ final class ShellEnvironmentTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(started), 5)
     }
 
+    func testAChildHoldingThePipeKeepsNoLoadWaiting() {
+        let started = Date()
+        let environment = ShellEnvironment.run(
+            shell: "/bin/sh", arguments: ["-c", "echo HELD=no; (sleep 20 &); exit 0"], timeout: 10)
+        XCTAssertEqual(environment?["HELD"], "no")
+        XCTAssertLessThan(Date().timeIntervalSince(started), 5)
+    }
+
+    func testAChildWritingAfterTheShellExitsKeepsNoLoadWaiting() {
+        let started = Date()
+        // The child writes for about ten seconds and ends on its own.
+        let script = """
+            echo WRITING=no; \
+            (i=0; while [ $i -lt 500 ]; do echo; sleep 0.02; i=$((i+1)); done &); exit 0
+            """
+        let environment = ShellEnvironment.run(
+            shell: "/bin/sh", arguments: ["-c", script], timeout: 20)
+        XCTAssertEqual(environment?["WRITING"], "no")
+        XCTAssertLessThan(Date().timeIntervalSince(started), 5)
+    }
+
+    /// Read at user-initiated priority, as a launch reads it, the read
+    /// answers. Whether a wait inverts priority is Xcode's Thread Performance
+    /// Checker's to see, and `swift test` runs none.
+    func testAReadAtUserInitiatedPriorityAnswers() {
+        let done = expectation(description: "Read at user-initiated priority")
+        DispatchQueue.global(qos: .userInitiated).async {
+            let environment = ShellEnvironment.run(
+                shell: "/bin/sh", arguments: ["-c", "sleep 0.2; echo QOS=ok"], timeout: 5)
+            XCTAssertEqual(environment?["QOS"], "ok")
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 10)
+    }
+
     func testAShellReadingStdinGetsNoInput() {
         let environment = ShellEnvironment.run(
             shell: "/bin/sh", arguments: ["-c", "read line; echo READ=done"], timeout: 5)
