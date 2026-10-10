@@ -202,14 +202,19 @@ public struct AnyCodable: Codable, Sendable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
 
+        // A string is read before any number: YYJSON's `Double` arm reads a
+        // numeric string as a number, so a select's value id such as "200000"
+        // would otherwise leave here as a number and the typed decode behind
+        // it would refuse the string it expects. Both coders read `String`
+        // strictly, so a number never becomes a string this way.
         if let bool = try? container.decode(Bool.self) {
             value = bool
+        } else if let string = try? container.decode(String.self) {
+            value = string
         } else if let int = try? container.decode(Int.self) {
             value = int
         } else if let double = try? container.decode(Double.self) {
             value = double
-        } else if let string = try? container.decode(String.self) {
-            value = string
         } else if let array = try? container.decode([AnyCodable].self) {
             value = array.map { $0.value }
         } else if let dict = try? container.decode([String: AnyCodable].self) {

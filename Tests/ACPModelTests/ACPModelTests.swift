@@ -662,6 +662,27 @@ final class ACPModelTests: XCTestCase {
         XCTAssertEqual(json["number"] as? Int, 123)
     }
 
+    /// Through the ACP coders, YYJSON's, whose `Double` reads a numeric string
+    /// as a number: a value id such as "200000" comes back out as the string it
+    /// went in as, and a number, a real, a bool, and a null each as themselves.
+    func testAnyCodableKeepsANumericStringAStringThroughTheACPCoders() throws {
+        let data = Data(#"{"text":"200000","int":200000,"real":1.5,"flag":true,"none":null}"#.utf8)
+        let decoded = try ACPJSONDecoder().decode([String: AnyCodable].self, from: data)
+        XCTAssertEqual(decoded["text"]?.value as? String, "200000")
+        XCTAssertEqual(decoded["int"]?.value as? Int, 200000)
+        XCTAssertEqual(decoded["real"]?.value as? Double, 1.5)
+        XCTAssertEqual(decoded["flag"]?.value as? Bool, true)
+        XCTAssertTrue(decoded["none"]?.value is NSNull)
+
+        let encoded = try ACPJSONEncoder().encode(decoded)
+        let json = try JSONSerialization.jsonObject(with: encoded) as! [String: Any]
+        XCTAssertEqual(json["text"] as? String, "200000")
+        XCTAssertEqual(json["int"] as? Int, 200000)
+        XCTAssertEqual(json["real"] as? Double, 1.5)
+        XCTAssertEqual(json["flag"] as? Bool, true)
+        XCTAssertTrue(json["none"] is NSNull)
+    }
+
     // MARK: - Request/Response Tests
 
     func testInitializeRequestEncoding() throws {
