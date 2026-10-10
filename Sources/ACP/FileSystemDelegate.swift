@@ -41,11 +41,11 @@ public actor FileSystemDelegate {
 
         let filteredContent: String
         if let startLine = line, let lineLimit = limit {
-            let startIdx = max(0, startLine - 1)
-            let endIdx = min(lines.count, startIdx + lineLimit)
+            let startIdx = min(lines.count, max(1, startLine) - 1)
+            let endIdx = startIdx + min(lines.count - startIdx, max(0, lineLimit))
             filteredContent = lines[startIdx..<endIdx].joined(separator: "\n")
         } else if let startLine = line {
-            let startIdx = max(0, startLine - 1)
+            let startIdx = min(lines.count, max(1, startLine) - 1)
             filteredContent = lines[startIdx...].joined(separator: "\n")
         } else {
             filteredContent = content
