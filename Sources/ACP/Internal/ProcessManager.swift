@@ -324,7 +324,8 @@ actor ACPProcessManager {
     /// two seconds on. A LEADER THAT ENDS ON ITS OWN STILL TAKES ITS GROUP:
     /// a program the agent started runs in the agent's group and outlives
     /// it, so the group takes a SIGTERM even where the agent ended within
-    /// the grace. Returns once the process has exited or the kill is sent.
+    /// the grace. Returns once the process has exited, its exit recorded
+    /// (`lastExit`), or once the kill is sent.
     func terminate(grace: TimeInterval = 0) async {
         stateLock.withLock { stdinWriter }?.close()
         stateLock.withLock { stdinWriter = nil }
@@ -363,6 +364,20 @@ actor ACPProcessManager {
             if !exited, !(await proc.waitForExit(within: 2.0)) {
                 Self.signal(SIGKILL, group: pgid, pid: proc.pid)
                 _ = await proc.waitForExit(within: 2.0)
+            }
+            // THE EXIT IS RECORDED BEFORE THE TERMINATE RETURNS: the reap
+            // resumes these waits first and starts the task that handles the
+            // exit after them, so that task can run after `Client.terminate`
+            // has fired the closed sink, which `lastExit` is to precede. The
+            // reader stopped above holds the tail still, and that task's own
+            // write finds the same status and the same tail.
+            if let status = proc.exitStatus {
+                let tail = stderrTail
+                stateLock.withLock {
+                    if exitRecord == nil {
+                        exitRecord = AgentExit(status: status, stderrTail: tail)
+                    }
+                }
             }
         }
         await ProcessRegistry.shared.removeProcess(pid: pid, pgid: pgid)
@@ -568,6 +583,7 @@ final class ACPSpawnedProcess: @unchecked Sendable {
     let pid: pid_t
     private let lock = NSLock()
     private var exited = false
+    private var reapedStatus: Int32?
     private var exitWaiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
     private var source: DispatchSourceProcess?
     private let queue = DispatchQueue(label: "org.acp.process.exit")
@@ -575,6 +591,12 @@ final class ACPSpawnedProcess: @unchecked Sendable {
     /// True until the exit has been reaped.
     var isRunning: Bool {
         lock.withLock { !exited }
+    }
+
+    /// The status the reap hands on, kept with `exited` before any wait
+    /// resumes, so a wait the reap ends reads it; nil until the reap.
+    var exitStatus: Int32? {
+        lock.withLock { reapedStatus }
     }
 
     init(pid: pid_t, onExit: @escaping @Sendable (Int32) -> Void) {
@@ -601,6 +623,7 @@ final class ACPSpawnedProcess: @unchecked Sendable {
         lock.lock()
         let first = !exited
         exited = true
+        if first { reapedStatus = status }
         let waiters = first ? Array(exitWaiters.values) : []
         if first { exitWaiters.removeAll() }
         lock.unlock()

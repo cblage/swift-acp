@@ -124,4 +124,16 @@ final class AgentProcessTests: XCTestCase {
         await fulfillment(of: [closed], timeout: 5)
         XCTAssertEqual(client.lastExit, AgentExit(status: 2, stderrTail: "fatal: boom\n"))
     }
+
+    func testAClientsTerminateReturnsWithItsAgentsExitRecorded() async throws {
+        let path = try agent("""
+            exec sleep 600
+            """)
+        let client = Client()
+        try await client.launch(agentPath: path)
+        await client.terminate()
+        XCTAssertEqual(
+            client.lastExit?.status, SIGTERM,
+            "Recorded before the terminate returns, and so before the closed sink it fires")
+    }
 }
