@@ -683,6 +683,79 @@ final class ACPModelTests: XCTestCase {
         XCTAssertTrue(json["none"] is NSNull)
     }
 
+    /// A JSON real keeps its fraction through `AnyCodable`, through the ACP
+    /// coders and Foundation's alike: it decodes as a `Double` and goes back
+    /// out as the same real. An integer stays an exact `Int`, at `Int`'s ends
+    /// and past 2^53 too, and so does a real with no fraction, `1.0`, which
+    /// both coders' `Int` arms read as 1; a whole number past `Int.max` is the
+    /// nearest `Double`, and a numeric string, a bool, a null, an array, and
+    /// an object each decode as themselves.
+    func testAnyCodableKeepsARealsFractionAndAnIntegerExactThroughBothCoders() throws {
+        let data = Data(
+            (#"{"real":1.5,"negative":-2.25,"small":0.1,"tiny":1e-300,"whole":1.0,"#
+                + #""max":9223372036854775807,"min":-9223372036854775808,"#
+                + #""past53":9007199254740993,"pastMax":9223372036854775808,"#
+                + #""text":"1.5","list":[1,2.5,"3",true,null],"nested":{"ratio":0.75}}"#)
+                .utf8)
+        typealias Coder = (
+            name: String, decode: (Data) throws -> [String: AnyCodable],
+            encode: ([String: AnyCodable]) throws -> Data
+        )
+        let coders: [Coder] = [
+            (
+                "ACP", { try ACPJSONDecoder().decode([String: AnyCodable].self, from: $0) },
+                { try ACPJSONEncoder().encode($0) }
+            ),
+            (
+                "Foundation", { try JSONDecoder().decode([String: AnyCodable].self, from: $0) },
+                { try JSONEncoder().encode($0) }
+            ),
+        ]
+        for coder in coders {
+            let decoded = try coder.decode(data)
+            let reencoded = try coder.decode(try coder.encode(decoded))
+            for (pass, values) in [("decoded", decoded), ("re-encoded", reencoded)] {
+                let context = "\(coder.name), \(pass)"
+                assertHolds(values["real"]?.value, 1.5, context)
+                assertHolds(values["negative"]?.value, -2.25, context)
+                assertHolds(values["small"]?.value, 0.1, context)
+                assertHolds(values["tiny"]?.value, 1e-300, context)
+                assertHolds(values["whole"]?.value, 1, context)
+                assertHolds(values["max"]?.value, Int.max, context)
+                assertHolds(values["min"]?.value, Int.min, context)
+                assertHolds(values["past53"]?.value, 9_007_199_254_740_993, context)
+                assertHolds(values["pastMax"]?.value, 9_223_372_036_854_775_808.0, context)
+                assertHolds(values["text"]?.value, "1.5", context)
+                let list = try XCTUnwrap(values["list"]?.value as? [Any], context)
+                XCTAssertEqual(list.count, 5, context)
+                if list.count == 5 {
+                    assertHolds(list[0], 1, context)
+                    assertHolds(list[1], 2.5, context)
+                    assertHolds(list[2], "3", context)
+                    assertHolds(list[3], true, context)
+                    XCTAssertTrue(list[4] is NSNull, context)
+                }
+                let nested = try XCTUnwrap(values["nested"]?.value as? [String: Any], context)
+                assertHolds(nested["ratio"], 0.75, context)
+            }
+        }
+    }
+
+    /// `value` holds `expected` as `T` itself, not as a number of another type.
+    private func assertHolds<T: Equatable>(
+        _ value: Any?, _ expected: T, _ context: String,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        guard let value else {
+            return XCTFail("\(context): nothing, not \(T.self) \(expected)", file: file, line: line)
+        }
+        XCTAssertTrue(
+            type(of: value) == T.self,
+            "\(context): \(type(of: value)) \(value), not \(T.self) \(expected)",
+            file: file, line: line)
+        XCTAssertEqual(value as? T, expected, context, file: file, line: line)
+    }
+
     // MARK: - Request/Response Tests
 
     func testInitializeRequestEncoding() throws {

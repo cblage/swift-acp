@@ -212,7 +212,18 @@ public struct AnyCodable: Codable, Sendable {
         } else if let string = try? container.decode(String.self) {
             value = string
         } else if let int = try? container.decode(Int.self) {
-            value = int
+            // A REAL KEEPS ITS FRACTION: YYJSON's `Int` arm reads a real as its
+            // truncation toward zero, 1.5 as 1, so an `Int` reading that the
+            // coder's own `Double` reading does not equal is a real's, and the
+            // `Double` is kept. An integer stays an exact `Int` — at `Int`'s
+            // ends and past 2^53 as well, where both readings round alike —
+            // and so does a real with no fraction: both coders' `Int` arms read
+            // `1.0` as 1, and the `Double` reading agrees.
+            if let double = try? container.decode(Double.self), Double(int) != double {
+                value = double
+            } else {
+                value = int
+            }
         } else if let double = try? container.decode(Double.self) {
             value = double
         } else if let array = try? container.decode([AnyCodable].self) {
