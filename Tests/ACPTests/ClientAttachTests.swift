@@ -98,4 +98,54 @@ final class ClientAttachTests: XCTestCase {
         await client.terminate()
         withExtendedLifetime(delegate) {}
     }
+
+    /// A request whose write is still in flight when the client terminates
+    /// fails with `processNotRunning` once the write lands: the terminate's
+    /// sweep ran while the write held it, and a request registered after
+    /// that sweep would wait for an answer and a sweep that never come.
+    func testARequestWhoseWriteOutlivesTheTerminateFailsWhenTheWriteLands() async throws {
+        let agentOut = Pipe()
+        let agentIn = Pipe()
+        let client = Client()
+        try await client.attach(
+            reading: agentOut.fileHandleForReading, writing: agentIn.fileHandleForWriting)
+
+        // A megabyte, past any pipe's buffer, with nobody reading stdin: the
+        // write holds the request until the drain below.
+        let text = String(repeating: "x", count: 1 << 20)
+        let ended = expectation(description: "the request ended")
+        Task {
+            defer { ended.fulfill() }
+            do {
+                _ = try await client.sendPrompt(
+                    sessionId: SessionId("s"), content: [.text(TextContent(text: text))])
+                XCTFail("The request returned an answer the agent never sent")
+            } catch ClientError.processNotRunning {
+                // The error the terminate's sweep gives a pending request.
+            } catch {
+                XCTFail("Expected processNotRunning, got \(error)")
+            }
+        }
+
+        // The write in flight: its first bytes are in the pipe, so it runs on
+        // the stdin queue ahead of the close the terminate queues behind it.
+        let readEnd = agentIn.fileHandleForReading.fileDescriptor
+        let writing = await Task.detached { () -> Bool in
+            var reader = pollfd(fd: readEnd, events: Int16(POLLIN), revents: 0)
+            return poll(&reader, 1, 5_000) == 1
+        }.value
+        XCTAssertTrue(writing, "The request's write never began")
+        await client.terminate()
+
+        // The drain, after the terminate's sweep: the write lands, and the
+        // close queued behind it ends the read.
+        let drained = expectation(description: "stdin read to its close")
+        DispatchQueue.global().async {
+            _ = try? agentIn.fileHandleForReading.readToEnd()
+            drained.fulfill()
+        }
+        await fulfillment(of: [drained], timeout: 5)
+        await fulfillment(of: [ended], timeout: 5)
+        try agentOut.fileHandleForWriting.close()
+    }
 }

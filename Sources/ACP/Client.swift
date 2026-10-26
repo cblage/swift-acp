@@ -1068,6 +1068,12 @@ public actor Client {
             expectedRequestIds.remove(requestId)
             return early
         }
+        // A teardown during the write ends the request here: its sweep clears
+        // the id with every pending request, and a continuation registered
+        // after it would wait for an answer and a sweep that never come.
+        guard expectedRequestIds.contains(requestId) else {
+            throw ClientError.processNotRunning
+        }
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 pendingRequests[requestId] = continuation
