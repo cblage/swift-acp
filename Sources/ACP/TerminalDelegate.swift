@@ -127,14 +127,14 @@ public actor TerminalDelegate {
         } else if args == nil || args?.isEmpty == true {
             if command.contains(" ") || command.contains("\"") {
                 let (parsedExecutable, parsedArgs) = try parseCommandString(command)
-                executablePath = try resolveExecutablePath(parsedExecutable)
+                executablePath = try await resolveExecutablePath(parsedExecutable)
                 finalArgs = parsedArgs
             } else {
-                executablePath = try resolveExecutablePath(command)
+                executablePath = try await resolveExecutablePath(command)
                 finalArgs = []
             }
         } else {
-            executablePath = try resolveExecutablePath(command)
+            executablePath = try await resolveExecutablePath(command)
             finalArgs = args ?? []
         }
 
@@ -283,7 +283,7 @@ public actor TerminalDelegate {
 
     /// Kill a terminal process
     public func handleTerminalKill(terminalId: TerminalId, sessionId: String) async throws -> KillTerminalResponse {
-        guard var state = terminals[terminalId.value] else {
+        guard let state = terminals[terminalId.value] else {
             throw TerminalError.terminalNotFound(terminalId.value)
         }
 
@@ -292,16 +292,8 @@ public actor TerminalDelegate {
         }
 
         if state.process.isRunning {
-            state.process.terminate()
-            state.process.waitUntilExit()
+            terminateWithEscalation(state.process)
         }
-
-        let exitCode = Int(state.process.terminationStatus)
-        for waiter in state.exitWaiters {
-            waiter.resume(returning: (exitCode, nil))
-        }
-        state.exitWaiters.removeAll()
-        terminals[terminalId.value] = state
 
         return KillTerminalResponse(_meta: nil)
     }
@@ -312,9 +304,15 @@ public actor TerminalDelegate {
             throw TerminalError.terminalNotFound(terminalId.value)
         }
 
+        guard !state.isReleased else {
+            throw TerminalError.terminalReleased(terminalId.value)
+        }
+
+        state.isReleased = true
+        terminals[terminalId.value] = state
         if state.process.isRunning {
-            state.process.terminate()
-            state.process.waitUntilExit()
+            terminateWithEscalation(state.process)
+            await waitForProcessExit(state.process)
         }
 
         cleanupProcessPipes(terminalId: terminalId.value)
@@ -331,7 +329,6 @@ public actor TerminalDelegate {
             exitCode: exitCode
         )
 
-        state.isReleased = true
         state.exitWaiters.removeAll()
         terminals.removeValue(forKey: terminalId.value)
 
@@ -340,18 +337,28 @@ public actor TerminalDelegate {
 
     /// Clean up all terminals
     public func cleanup() async {
-        for (terminalId, state) in terminals {
+        let terminalIds = terminals.filter { !$0.value.isReleased }.map(\.key)
+        for terminalId in terminalIds {
+            guard var state = terminals[terminalId] else { continue }
+            state.isReleased = true
+            terminals[terminalId] = state
             if state.process.isRunning {
-                state.process.terminate()
-                state.process.waitUntilExit()
-            }
-            cleanupProcessPipes(terminalId: terminalId)
-            let exitCode = Int(state.process.terminationStatus)
-            for waiter in state.exitWaiters {
-                waiter.resume(returning: (exitCode, nil))
+                terminateWithEscalation(state.process)
             }
         }
-        terminals.removeAll()
+
+        for terminalId in terminalIds {
+            guard let state = terminals[terminalId] else { continue }
+            await waitForProcessExit(state.process)
+            cleanupProcessPipes(terminalId: terminalId)
+            guard var currentState = terminals[terminalId] else { continue }
+            let exitCode = Int(state.process.terminationStatus)
+            for waiter in currentState.exitWaiters {
+                waiter.resume(returning: (exitCode, nil))
+            }
+            currentState.exitWaiters.removeAll()
+            terminals.removeValue(forKey: terminalId)
+        }
         releasedOutputs.removeAll()
         releasedOutputOrder.removeAll()
     }
@@ -441,6 +448,24 @@ public actor TerminalDelegate {
         }
     }
 
+    /// SIGTERM gets one second to end the process before SIGKILL bounds the
+    /// wait; the sleep suspends instead of holding the actor's executor.
+    private func terminateWithEscalation(_ process: Process) {
+        process.terminate()
+        Task {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard process.isRunning else { return }
+            _ = Darwin.kill(process.processIdentifier, SIGKILL)
+        }
+    }
+
+    /// Waiting suspends the task, leaving the serial executor free for requests.
+    private func waitForProcessExit(_ process: Process) async {
+        while process.isRunning {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+    }
+
     private func monitorProcessExit(terminalId: TerminalId) async {
         guard let state = terminals[terminalId.value] else { return }
         let process = state.process
@@ -515,7 +540,7 @@ public actor TerminalDelegate {
         return (exec, args)
     }
 
-    private func resolveExecutablePath(_ command: String) throws -> String {
+    private func resolveExecutablePath(_ command: String) async throws -> String {
         let fileManager = FileManager.default
 
         if command.hasPrefix("/") {
@@ -552,7 +577,7 @@ public actor TerminalDelegate {
 
         do {
             try process.run()
-            process.waitUntilExit()
+            await waitForProcessExit(process)
             if let data = try? pipe.fileHandleForReading.read(upToCount: 4096),
                let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) {
                 if !path.isEmpty && FileManager.default.fileExists(atPath: path) {
