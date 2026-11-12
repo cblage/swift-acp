@@ -169,7 +169,16 @@ public actor TerminalDelegate {
         ]
         terminals[terminalIdValue] = state
 
-        try process.run()
+        do {
+            try process.run()
+        } catch {
+            // The process never launched, so it is not a terminal. The
+            // sources are cancelled — their cancel handlers close the
+            // pipes — and the state is dropped before the error propagates.
+            for source in state.sources { source.cancel() }
+            terminals.removeValue(forKey: terminalIdValue)
+            throw error
+        }
         return CreateTerminalResponse(terminalId: terminalId, _meta: nil)
     }
 
@@ -231,7 +240,7 @@ public actor TerminalDelegate {
             exitStatus = nil
         } else {
             exitStatus = TerminalExitStatus(
-                exitCode: Int(state.process.terminationStatus),
+                exitCode: Int(processExitStatus(state.process)),
                 signal: nil,
                 _meta: nil
             )
@@ -258,7 +267,7 @@ public actor TerminalDelegate {
 
         if !state.process.isRunning {
             return WaitForExitResponse(
-                exitCode: Int(state.process.terminationStatus),
+                exitCode: Int(processExitStatus(state.process)),
                 signal: nil,
                 _meta: nil
             )
@@ -318,7 +327,7 @@ public actor TerminalDelegate {
         cleanupProcessPipes(terminalId: terminalId.value)
         state = terminals[terminalId.value] ?? state
 
-        let exitCode = Int(state.process.terminationStatus)
+        let exitCode = Int(processExitStatus(state.process))
         for waiter in state.exitWaiters {
             waiter.resume(returning: (exitCode, nil))
         }
@@ -352,7 +361,7 @@ public actor TerminalDelegate {
             await waitForProcessExit(state.process)
             cleanupProcessPipes(terminalId: terminalId)
             guard var currentState = terminals[terminalId] else { continue }
-            let exitCode = Int(state.process.terminationStatus)
+            let exitCode = Int(processExitStatus(state.process))
             for waiter in currentState.exitWaiters {
                 waiter.resume(returning: (exitCode, nil))
             }
@@ -459,6 +468,15 @@ public actor TerminalDelegate {
         }
     }
 
+    /// `terminationStatus` raises until Foundation has collected the exit.
+    /// `isRunning == false` does not mean that collection has happened.
+    /// `waitUntilExit()` returns once it has, and the wait is short because
+    /// the process has already exited.
+    private func processExitStatus(_ process: Process) -> Int32 {
+        process.waitUntilExit()
+        return process.terminationStatus
+    }
+
     /// Waiting suspends the task, leaving the serial executor free for requests.
     private func waitForProcessExit(_ process: Process) async {
         while process.isRunning {
@@ -478,7 +496,7 @@ public actor TerminalDelegate {
         guard var currentState = terminals[terminalId.value],
               !currentState.exitWaiters.isEmpty else { return }
 
-        let exitCode = Int(process.terminationStatus)
+        let exitCode = Int(processExitStatus(process))
         for waiter in currentState.exitWaiters {
             waiter.resume(returning: (exitCode, nil))
         }
