@@ -33,11 +33,11 @@ public actor Client {
 
     private let logger = Logger.forCategory("Client")
 
-    private let processManager: ACPProcessManager
+    let processManager: ACPProcessManager
     private let requestRouter: ACPRequestRouter
     private let errorHandler: ErrorHandler
 
-    private var pendingRequests: [RequestId: CheckedContinuation<JSONRPCResponse, Error>] = [:]
+    var pendingRequests: [RequestId: CheckedContinuation<JSONRPCResponse, Error>] = [:]
     /// A deadline per bounded request — a GCD work item, NOT a task. The old
     /// timeout raced the request against a sleeping child in a task group,
     /// which on expiry threw out of the group and then awaited the very
@@ -45,13 +45,13 @@ public actor Client {
     /// request cost one task to sleep and another to register and write.
     /// The item fires only when the bound actually lapses; a request that
     /// answers in time cancels it and creates nothing.
-    private var pendingTimeouts: [RequestId: DispatchWorkItem] = [:]
+    var pendingTimeouts: [RequestId: DispatchWorkItem] = [:]
     /// Requests written but not yet awaited: a response arriving in the gap
     /// while the write suspends this actor parks in `earlyResponses` for the
     /// continuation that registers right after it.
-    private var expectedRequestIds: Set<RequestId> = []
-    private var earlyResponses: [RequestId: JSONRPCResponse] = [:]
-    private var nextRequestId: Int = 1
+    var expectedRequestIds: Set<RequestId> = []
+    var earlyResponses: [RequestId: JSONRPCResponse] = [:]
+    var nextRequestId: Int = 1
 
     private let notificationContinuation: AsyncStream<JSONRPCNotification>.Continuation
     private let notificationStream: AsyncStream<JSONRPCNotification>
@@ -77,8 +77,8 @@ public actor Client {
     /// `Sendable`, so the router, the error handler, and the read queue
     /// each build theirs instead of sharing these. The writer escapes no
     /// slash by default, which is what Foundation's needed telling.
-    private let decoder: ACPJSONDecoder
-    private let encoder: ACPJSONEncoder
+    let decoder: ACPJSONDecoder
+    let encoder: ACPJSONEncoder
 
     /// ONE SERIAL QUEUE PER CONNECTION, and every actor of the connection
     /// runs on it: this one, the process manager, the router, and the
@@ -1032,69 +1032,6 @@ public actor Client {
         return false
     }
 
-    public func sendRequest<T: Encodable>(
-        method: String,
-        params: T,
-        timeout: TimeInterval? = nil
-    ) async throws -> JSONRPCResponse {
-        guard await processManager.isRunning() else {
-            throw ClientError.processNotRunning
-        }
-
-        let requestId = RequestId.number(nextRequestId)
-        nextRequestId += 1
-
-        let paramsData = try encoder.encode(params)
-        let paramsValue = try decoder.decode(AnyCodable.self, from: paramsData)
-
-        let request = JSONRPCRequest(
-            id: requestId,
-            method: method,
-            params: paramsValue
-        )
-        // TASK-FREE on the ordinary path: the id is expected BEFORE the write,
-        // so a response landing while the write suspends this actor parks in
-        // `earlyResponses`; the continuation registers synchronously after
-        // the write, on this actor, leaving no gap for a response to miss.
-        expectedRequestIds.insert(requestId)
-        do {
-            try await writeMessageWithDebug(request, method: method)
-        } catch {
-            expectedRequestIds.remove(requestId)
-            earlyResponses.removeValue(forKey: requestId)
-            throw error
-        }
-        if let early = earlyResponses.removeValue(forKey: requestId) {
-            expectedRequestIds.remove(requestId)
-            return early
-        }
-        // A teardown during the write ends the request here: its sweep clears
-        // the id with every pending request, and a continuation registered
-        // after it would wait for an answer and a sweep that never come.
-        guard expectedRequestIds.contains(requestId) else {
-            throw ClientError.processNotRunning
-        }
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                pendingRequests[requestId] = continuation
-                if let timeout {
-                    // The deadline: a work item that spawns a task ONLY when
-                    // it fires. A late answer then finds no continuation and
-                    // is dropped; the request is abandoned, never awaited.
-                    let deadline = DispatchWorkItem { [weak self] in
-                        guard let self else { return }
-                        Task { await self.failRequest(id: requestId, error: ClientError.requestTimeout) }
-                    }
-                    pendingTimeouts[requestId] = deadline
-                    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: deadline)
-                }
-            }
-        } onCancel: {
-            // A cancelled caller is released at once and the request
-            // abandoned the same way a timed-out one is.
-            Task { await self.failRequest(id: requestId, error: CancellationError()) }
-        }
-    }
 
     public func sendCancelNotification(sessionId: SessionId) async throws {
         guard await processManager.isRunning() else {
@@ -1360,7 +1297,7 @@ public actor Client {
         takeClosedSink()?()
     }
 
-    private func failRequest(id: RequestId, error: Error) async {
+    func failRequest(id: RequestId, error: Error) async {
         expectedRequestIds.remove(id)
         earlyResponses.removeValue(forKey: id)
         pendingTimeouts.removeValue(forKey: id)?.cancel()
@@ -1394,7 +1331,9 @@ public actor Client {
     /// Encodes ONCE, here on this actor, and hands the bytes to the process
     /// actor: the generic value is not `Sendable` and could not cross, and
     /// the debug stream used to pay a second encode of its own.
-    private func writeMessageWithDebug<T: Encodable>(_ message: T, method: String? = nil) async throws {
+    func writeMessageWithDebug<T: Encodable>(
+        _ message: T, method: String? = nil, deadline: DispatchTime? = nil
+    ) async throws {
         let data = try encoder.encode(message)
         // The scoped form: a bare lock/unlock pair is not allowed across
         // an async context.
@@ -1408,7 +1347,7 @@ public actor Client {
                 method: method
             ))
         }
-        try await processManager.writeMessage(data)
+        try await processManager.writeMessage(data, deadline: deadline)
     }
 }
 

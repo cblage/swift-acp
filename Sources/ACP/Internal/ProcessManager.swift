@@ -44,6 +44,8 @@ actor ACPProcessManager {
     /// lock: the stdin writer, the newest of stderr, and the last exit.
     private let stateLock = NSLock()
     nonisolated(unsafe) private var stdinWriter: ACPStdinWriter?
+    /// Waiters leave on cancellation, their deadline, or this connection's end; frames stay queued.
+    private var pendingWrites: [ObjectIdentifier: ACPWriteWait] = [:]
     nonisolated(unsafe) private var stderrTailBytes = Data()
     nonisolated(unsafe) private var exitRecord: AgentExit?
 
@@ -327,6 +329,7 @@ actor ACPProcessManager {
     /// the grace. Returns once the process has exited, its exit recorded
     /// (`lastExit`), or once the kill is sent.
     func terminate(grace: TimeInterval = 0) async {
+        failPendingWrites(error: ClientError.processNotRunning)
         stateLock.withLock { stdinWriter }?.close()
         stateLock.withLock { stdinWriter = nil }
         if attached {
@@ -403,23 +406,31 @@ actor ACPProcessManager {
     /// Writes one encoded message as a line. The BYTES cross to this
     /// actor, encoded by the caller on its own: a generic `Encodable`
     /// value is not `Sendable`, and the client encodes once anyway.
-    func writeMessage(_ data: Data) async throws {
+    func writeMessage(_ data: Data, deadline: DispatchTime? = nil) async throws {
         guard let writer = stateLock.withLock({ stdinWriter }),
             process?.isRunning == true || attached
         else {
             throw ClientError.processNotRunning
         }
         let lineData = data + Data([0x0A])
-        try await withCheckedThrowingContinuation {
-            (continuation: CheckedContinuation<Void, Error>) in
-            writer.write(lineData) { error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume()
-                }
+        let wait = ACPWriteWait()
+        let id = ObjectIdentifier(wait)
+        pendingWrites[id] = wait
+        defer { pendingWrites[id] = nil }
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                wait.install(continuation, deadline: deadline)
+                writer.write(lineData) { error in wait.finish(error) }
             }
+        } onCancel: {
+            wait.finish(CancellationError())
         }
+    }
+
+    private func failPendingWrites(error: Error) {
+        let waits = pendingWrites.values
+        pendingWrites.removeAll()
+        for wait in waits { wait.finish(error) }
     }
 
     /// The bytes as they are to stdin, after every write before them, from
@@ -489,6 +500,7 @@ actor ACPProcessManager {
         stderrLineContinuation = nil
         stderrLineStream = nil
 
+        failPendingWrites(error: ClientError.processFailed(exitCode))
         stateLock.withLock { stdinWriter }?.close()
         stateLock.withLock { stdinWriter = nil }
         attached = false
@@ -657,76 +669,6 @@ final class ACPSpawnedProcess: @unchecked Sendable {
     }
 }
 
-/// THE AGENT'S STDIN, written on ONE serial queue in call order, its close
-/// queued behind the writes before it — the descriptor read on the queue,
-/// so no write ever meets a descriptor closed and reused under it. Writes
-/// run HERE, never on an actor: a write to a full pipe blocks until the
-/// agent reads, and an agent busy emitting a replay may not read for tens
-/// of seconds — on the process actor that blocked stdout's processing for
-/// exactly as long (a 2026-09-03 profile showed model and effort requests
-/// parked 14–32s in the write while the transcript stalled). A write the
-/// agent never reads ends with the agent: its death fails the write with
-/// EPIPE, never a signal, and the close queued behind it runs then.
-final class ACPStdinWriter: @unchecked Sendable {
-    private let lock = NSLock()
-    private var handle: FileHandle?
-    private let queue: DispatchQueue
-    private let qos: DispatchQoS
-    private let enforced: DispatchWorkItemFlags
-
-    /// THE APP'S BAND, enforced when one was given: the write holds the
-    /// intake's QoS whatever the submitter's.
-    init(_ handle: FileHandle, qos: DispatchQoS) {
-        self.handle = handle
-        self.qos = qos
-        self.enforced = qos == .unspecified ? [] : [.enforceQoS]
-        self.queue = DispatchQueue(label: "org.acp.process.stdin", qos: qos)
-    }
-
-    /// The bytes as they are, after every write before them; `completion`
-    /// gets nil once written, or the failure.
-    func write(_ data: Data, completion: @escaping @Sendable (Error?) -> Void) {
-        queue.async(qos: qos, flags: enforced) { [self] in
-            guard let fd = lock.withLock({ handle?.fileDescriptor }), fd >= 0 else {
-                completion(ClientError.processNotRunning)
-                return
-            }
-            // A raw write to a pipe whose reader has died raises SIGPIPE for
-            // the whole process; the descriptor opts out so a dead agent
-            // reads as EPIPE, the error path, not a kill.
-            _ = fcntl(fd, F_SETNOSIGPIPE, 1)
-            let failure: Int32 = data.withUnsafeBytes { raw in
-                guard let base = raw.baseAddress else { return 0 }
-                var offset = 0
-                while offset < raw.count {
-                    let written = Darwin.write(fd, base + offset, raw.count - offset)
-                    if written < 0 {
-                        if errno == EINTR { continue }
-                        return errno
-                    }
-                    offset += written
-                }
-                return 0
-            }
-            completion(
-                failure == 0
-                    ? nil
-                    : ClientError.transportError(
-                        "stdin write failed: \(String(cString: strerror(failure)))"))
-        }
-    }
-
-    /// Stdin closed after every write before it — the agent's own end.
-    func close() {
-        queue.async(qos: qos, flags: enforced) { [self] in
-            let closing = lock.withLock { () -> FileHandle? in
-                defer { handle = nil }
-                return handle
-            }
-            try? closing?.close()
-        }
-    }
-}
 
 /// What the framer read off a frame's top level while walking it: the
 /// `method` string, and whether an `id` key holds a value — `null` reads as
