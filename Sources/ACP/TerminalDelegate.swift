@@ -13,6 +13,7 @@ import ACPModel
 /// Tracks state of a single terminal
 private struct TerminalState: @unchecked Sendable {
     let process: Process
+    let exit: TerminalProcessExit
     /// BYTES, not a `String`: a chunk of output costs its own append. The
     /// string buffer this replaces counted its characters on every chunk,
     /// a walk of up to a megabyte per 64 KiB that pinned a thread for the
@@ -22,7 +23,6 @@ private struct TerminalState: @unchecked Sendable {
     var lastReadIndex: Int = 0
     var isReleased: Bool = false
     var wasTruncated: Bool = false
-    var exitWaiters: [CheckedContinuation<(exitCode: Int?, signal: String?), Never>] = []
     /// The read sources on the process's stdout and stderr, cancelled at
     /// release; their cancel handlers close the handles.
     var sources: [DispatchSourceRead] = []
@@ -32,6 +32,55 @@ private struct TerminalState: @unchecked Sendable {
 private struct ReleasedTerminalOutput: Sendable {
     let output: String
     let exitCode: Int?
+}
+
+/// Collects a launched `Process`'s exit status once from `terminationHandler`
+/// and resumes every awaiting caller outside its lock without `waitUntilExit()`.
+final class TerminalProcessExit: @unchecked Sendable {
+    private let lock = NSLock()
+    private var status: Int32?
+    private var waiters: [CheckedContinuation<Int32, Never>] = []
+
+    func attach(to process: Process) {
+        process.terminationHandler = { [self] finished in
+            let collected = finished.terminationStatus
+            finished.terminationHandler = nil
+            self.deliver(collected)
+        }
+    }
+
+    func detach(from process: Process) {
+        process.terminationHandler = nil
+    }
+
+    func deliver(_ exitStatus: Int32) {
+        let pending: [CheckedContinuation<Int32, Never>] = lock.withLock {
+            guard status == nil else { return [] }
+            status = exitStatus
+            let drained = waiters
+            waiters.removeAll()
+            return drained
+        }
+        for waiter in pending {
+            waiter.resume(returning: exitStatus)
+        }
+    }
+
+    func wait(onRegister: (@Sendable () -> Void)? = nil) async -> Int32 {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Int32, Never>) in
+            let settled: Int32? = lock.withLock {
+                if let status {
+                    return status
+                }
+                waiters.append(continuation)
+                return nil
+            }
+            onRegister?()
+            if let settled {
+                continuation.resume(returning: settled)
+            }
+        }
+    }
 }
 
 /// Actor responsible for handling terminal operations for agent sessions
@@ -75,6 +124,8 @@ public actor TerminalDelegate {
     /// connection at once. The read sources below fire on the same queue,
     /// so a chunk lands in the buffer without a task hop.
     private let executionQueue: DispatchSerialQueue
+    private let makeProcess: @Sendable () -> Process
+    var activeTerminalCount: Int { terminals.count }
 
     public nonisolated var unownedExecutor: UnownedSerialExecutor {
         executionQueue.asUnownedSerialExecutor()
@@ -98,6 +149,12 @@ public actor TerminalDelegate {
     /// natural choice, since the agent waits on these replies.
     public init(qos: DispatchQoS = .unspecified) {
         executionQueue = DispatchSerialQueue(label: "org.acp.terminal", qos: qos)
+        makeProcess = { Process() }
+    }
+
+    init(qos: DispatchQoS = .unspecified, makeProcess: @escaping @Sendable () -> Process) {
+        executionQueue = DispatchSerialQueue(label: "org.acp.terminal", qos: qos)
+        self.makeProcess = makeProcess
     }
 
     // MARK: - Terminal Operations
@@ -138,7 +195,7 @@ public actor TerminalDelegate {
             finalArgs = args ?? []
         }
 
-        let process = Process()
+        let process = makeProcess()
         process.executableURL = URL(fileURLWithPath: executablePath)
         process.arguments = finalArgs
 
@@ -162,7 +219,14 @@ public actor TerminalDelegate {
         let terminalIdValue = UUID().uuidString
         let terminalId = TerminalId(terminalIdValue)
 
-        var state = TerminalState(process: process, outputByteLimit: outputByteLimit ?? defaultOutputByteLimit)
+        let exit = TerminalProcessExit()
+        exit.attach(to: process)
+
+        var state = TerminalState(
+            process: process,
+            exit: exit,
+            outputByteLimit: outputByteLimit ?? defaultOutputByteLimit
+        )
         state.sources = [
             makeReadSource(outputPipe.fileHandleForReading, terminalId: terminalIdValue),
             makeReadSource(errorPipe.fileHandleForReading, terminalId: terminalIdValue),
@@ -175,6 +239,7 @@ public actor TerminalDelegate {
             // The process never launched, so it is not a terminal. The
             // sources are cancelled — their cancel handlers close the
             // pipes — and the state is dropped before the error propagates.
+            exit.detach(from: process)
             for source in state.sources { source.cancel() }
             terminals.removeValue(forKey: terminalIdValue)
             throw error
@@ -239,8 +304,11 @@ public actor TerminalDelegate {
         if state.process.isRunning {
             exitStatus = nil
         } else {
+            let exitCode = Int(await state.exit.wait())
+            drainAvailableOutput(terminalId: terminalId.value)
+            state = terminals[terminalId.value] ?? state
             exitStatus = TerminalExitStatus(
-                exitCode: Int(processExitStatus(state.process)),
+                exitCode: exitCode,
                 signal: nil,
                 _meta: nil
             )
@@ -265,27 +333,10 @@ public actor TerminalDelegate {
             throw TerminalError.terminalReleased(terminalId.value)
         }
 
-        if !state.process.isRunning {
-            return WaitForExitResponse(
-                exitCode: Int(processExitStatus(state.process)),
-                signal: nil,
-                _meta: nil
-            )
-        }
-
-        let result = await withCheckedContinuation { continuation in
-            var waiterState = state
-            waiterState.exitWaiters.append(continuation)
-            terminals[terminalId.value] = waiterState
-
-            Task {
-                await self.monitorProcessExit(terminalId: terminalId)
-            }
-        }
-
+        let exitCode = Int(await state.exit.wait())
         return WaitForExitResponse(
-            exitCode: result.exitCode,
-            signal: result.signal,
+            exitCode: exitCode,
+            signal: nil,
             _meta: nil
         )
     }
@@ -321,16 +372,11 @@ public actor TerminalDelegate {
         terminals[terminalId.value] = state
         if state.process.isRunning {
             terminateWithEscalation(state.process)
-            await waitForProcessExit(state.process)
         }
+        let exitCode = Int(await state.exit.wait())
 
         cleanupProcessPipes(terminalId: terminalId.value)
         state = terminals[terminalId.value] ?? state
-
-        let exitCode = Int(processExitStatus(state.process))
-        for waiter in state.exitWaiters {
-            waiter.resume(returning: (exitCode, nil))
-        }
 
         cacheReleasedOutput(
             terminalId: terminalId.value,
@@ -338,7 +384,6 @@ public actor TerminalDelegate {
             exitCode: exitCode
         )
 
-        state.exitWaiters.removeAll()
         terminals.removeValue(forKey: terminalId.value)
 
         return ReleaseTerminalResponse(_meta: nil)
@@ -358,14 +403,8 @@ public actor TerminalDelegate {
 
         for terminalId in terminalIds {
             guard let state = terminals[terminalId] else { continue }
-            await waitForProcessExit(state.process)
+            _ = await state.exit.wait()
             cleanupProcessPipes(terminalId: terminalId)
-            guard var currentState = terminals[terminalId] else { continue }
-            let exitCode = Int(processExitStatus(state.process))
-            for waiter in currentState.exitWaiters {
-                waiter.resume(returning: (exitCode, nil))
-            }
-            currentState.exitWaiters.removeAll()
             terminals.removeValue(forKey: terminalId)
         }
         releasedOutputs.removeAll()
@@ -468,42 +507,6 @@ public actor TerminalDelegate {
         }
     }
 
-    /// `terminationStatus` raises until Foundation has collected the exit.
-    /// `isRunning == false` does not mean that collection has happened.
-    /// `waitUntilExit()` returns once it has, and the wait is short because
-    /// the process has already exited.
-    private func processExitStatus(_ process: Process) -> Int32 {
-        process.waitUntilExit()
-        return process.terminationStatus
-    }
-
-    /// Waiting suspends the task, leaving the serial executor free for requests.
-    private func waitForProcessExit(_ process: Process) async {
-        while process.isRunning {
-            try? await Task.sleep(nanoseconds: 100_000_000)
-        }
-    }
-
-    private func monitorProcessExit(terminalId: TerminalId) async {
-        guard let state = terminals[terminalId.value] else { return }
-        let process = state.process
-
-        while process.isRunning {
-            try? await Task.sleep(nanoseconds: 100_000_000)
-            guard terminals[terminalId.value] != nil else { return }
-        }
-
-        guard var currentState = terminals[terminalId.value],
-              !currentState.exitWaiters.isEmpty else { return }
-
-        let exitCode = Int(processExitStatus(process))
-        for waiter in currentState.exitWaiters {
-            waiter.resume(returning: (exitCode, nil))
-        }
-        currentState.exitWaiters.removeAll()
-        terminals[terminalId.value] = currentState
-    }
-
     private func parseCommandString(_ command: String) throws -> (String, [String]) {
         var executable: String?
         var args: [String] = []
@@ -593,9 +596,12 @@ public actor TerminalDelegate {
             try? pipe.fileHandleForReading.close()
         }
 
+        let exit = TerminalProcessExit()
+        exit.attach(to: process)
+
         do {
             try process.run()
-            await waitForProcessExit(process)
+            _ = await exit.wait()
             if let data = try? pipe.fileHandleForReading.read(upToCount: 4096),
                let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) {
                 if !path.isEmpty && FileManager.default.fileExists(atPath: path) {
@@ -603,6 +609,7 @@ public actor TerminalDelegate {
                 }
             }
         } catch {
+            exit.detach(from: process)
             // Fallback if 'which' fails
         }
 
